@@ -378,7 +378,16 @@ def run_agent() -> None:
 
     while True:
         state = load_memory(config)
-        metrics = state.setdefault("metrics", {})
+        metrics_obj = state.get("metrics")
+        if not isinstance(metrics_obj, dict):
+            logging.warning(
+                "Ungültiges metrics-Format in Memory erkannt (%s). Setze metrics zurück.",
+                type(metrics_obj).__name__,
+            )
+            state["metrics"] = {}
+            metrics_obj = state["metrics"]
+
+        metrics = metrics_obj
         metrics.setdefault("loop_count", 0)
         metrics.setdefault("error_count", 0)
         metrics.setdefault("consecutive_errors", 0)
