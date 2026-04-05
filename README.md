@@ -53,6 +53,35 @@ MEMORY_FILE=memory/unikin_state.json
 LOG_FILE=logs/unikin.log
 ```
 
+
+## MCP Server & MCP Client
+
+Zusätzlich enthält `unikin` jetzt eine MCP-Integration:
+
+- `mcp_server.py`: Ein lokaler MCP-Server (JSON-RPC über STDIN/STDOUT) mit den Tools:
+  - `unikin.get_state`
+  - `unikin.step`
+- `mcp_client.py`: Ein einfacher CLI-Client, der den Server startet und Tools aufruft.
+
+### MCP-Server starten
+
+```bash
+python mcp_server.py
+```
+
+### MCP-Client nutzen
+
+```bash
+# Tool-Liste
+python mcp_client.py tools
+
+# Aktuellen Zustand lesen
+python mcp_client.py state
+
+# Einen autonomen Schritt ausführen
+python mcp_client.py step --note "manueller MCP-Trigger"
+```
+
 ## Start
 
 ```bash
