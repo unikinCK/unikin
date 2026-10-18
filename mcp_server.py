@@ -7,17 +7,19 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from typing import Any
 
-from openai import OpenAI
-
 from unikin import (
+    LOG_BACKUP_COUNT,
+    LOG_MAX_BYTES,
     build_prompt,
     call_model,
     clean_text,
     compute_interval,
     load_config,
     load_memory,
+    make_client,
     save_memory,
     similarity_score,
 )
@@ -30,10 +32,7 @@ class McpJsonLineServer:
     def __init__(self) -> None:
         self.config = load_config()
         self._setup_logging()
-        self.client = OpenAI(
-            base_url=self.config.openai_base_url,
-            api_key=self.config.openai_api_key,
-        )
+        self.client = make_client(self.config)
         logging.info("MCP-Server gestartet: %s", SERVER_INFO["name"])
 
 
@@ -51,7 +50,9 @@ class McpJsonLineServer:
         stream_handler = logging.StreamHandler(sys.stderr)
         stream_handler.setFormatter(formatter)
 
-        file_handler = logging.FileHandler(self.config.log_file, encoding="utf-8")
+        file_handler = RotatingFileHandler(
+            self.config.log_file, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+        )
         file_handler.setFormatter(formatter)
 
         root.addHandler(stream_handler)
