@@ -189,7 +189,7 @@ Abbildungen (PNG, SVG …) und Berichte (docx, pptx, xlsx, pdf, csv …), die de
 
 - Das Journal nennt jedes Artefakt als `/artifacts/<id>/<datei>` in der Werkzeugausgabe; derselbe Pfad unter `artifacts/` ist die Datei. Als Link sind sie nicht erreichbar, weil der Runner kein Port-Mapping hat.
 - Ansehen: auf dem Mac Studio mit `open ~/unikin/artifacts` im Finder, vom Laptop aus mit `rsync -a macstudio:unikin/artifacts/ ./artifacts/` (von git und `deploy.sh` ignoriert).
-- Der Runner löscht Artefakt-Ordner, die älter als 7 Tage sind; das ist im Runner-Code fest eingestellt. Was bleiben soll, vorher aus `artifacts/` herauskopieren.
+- Der Runner löscht nichts selbst (`PYTHON_MCP_ARTIFACT_RETENTION_DAYS: "0"` in `docker-compose.yml`); `artifacts/` wächst, bis man von Hand alte Ordner entfernt. Mit einer Zahl > 0 löscht der Runner Ordner, die älter als so viele Tage sind.
 - Die Dateien stammen aus Code, den das Modell geschrieben hat. Dieser Code kann alles unter `artifacts/` lesen, ändern und löschen, aber nichts sonst auf dem Host.
 
 ### Submodul
