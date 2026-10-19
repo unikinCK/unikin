@@ -1,0 +1,47 @@
+# Optional: Unikins MCP-Server dauerhaft über Streamable HTTP mit OAuth, z. B. für LibreChat.
+# Einschalten in .env (Compose liest COMPOSE_FILE und die Variablen von dort):
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.mcp-http.yml
+#   UNIKIN_MCP_PUBLIC_URL=https://macstudio.tail717550.ts.net:8020
+#   UNIKIN_OAUTH_USERS=christoph:<Hash aus python3 passwords.py>
+# Der Container lauscht nur auf 127.0.0.1; ins Tailnet bringt ihn Tailscale Serve per HTTPS:
+#   tailscale serve --bg --https=8020 http://127.0.0.1:18020
+
+services:
+  mcp:
+    build: .
+    image: unikin:local
+    container_name: unikin-mcp
+    restart: unless-stopped
+    command: ["python", "mcp_server.py", "--http"]
+    env_file:
+      - .env
+    environment:
+      UNIKIN_MCP_PUBLIC_URL: ${UNIKIN_MCP_PUBLIC_URL:?UNIKIN_MCP_PUBLIC_URL in .env setzen}
+      UNIKIN_OAUTH_USERS: ${UNIKIN_OAUTH_USERS:?UNIKIN_OAUTH_USERS in .env setzen (Hash mit python3 passwords.py)}
+      MEMORY_FILE: /app/memory/unikin_state.json
+      # Eigene Logdatei (logs/unikin-http-mcp.log), getrennt von den stdio-Einmal-Containern.
+      LOG_FILE: /app/logs/unikin-http.log
+    ports:
+      - "127.0.0.1:${UNIKIN_MCP_LOCAL_PORT:-18020}:8020"
+    # Liest das Gedächtnis, legt Nachrichten in memory/inbox/ und speichert OAuth-Clients und
+    # -Tokens (nur als Hash) in memory/oauth.sqlite3.
+    volumes:
+      - type: bind
+        source: ./memory
+        target: /app/memory
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./logs
+        target: /app/logs
+        bind:
+          create_host_path: false
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
