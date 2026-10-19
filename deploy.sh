@@ -6,7 +6,7 @@
 #   ./deploy.sh
 #   UNIKIN_HOST=anderer-host UNIKIN_DIR=agents/unikin ./deploy.sh
 #
-# .env, memory/ und logs/ auf dem Ziel bleiben unangetastet.
+# .env, memory/, logs/ und artifacts/ auf dem Ziel bleiben unangetastet.
 set -euo pipefail
 
 HOST="${UNIKIN_HOST:-macstudio}"
@@ -30,12 +30,12 @@ $SSH "$HOST" "mkdir -p '$DIR'"
 rsync -a -e "$SSH" \
   --exclude .git --exclude .github --exclude .claude \
   --exclude .venv --exclude venv --exclude __pycache__ --exclude .pytest_cache \
-  --exclude .env --exclude memory --exclude logs \
+  --exclude .env --exclude memory --exclude logs --exclude artifacts \
   ./ "$HOST:$DIR/"
 
 $SSH "$HOST" "export PATH=\"\$PATH:/opt/homebrew/bin:/usr/local/bin\"; \
   cd '$DIR' \
   && { [ -f .env ] || { cp .env.example .env && echo 'Hinweis: .env aus .env.example angelegt'; }; } \
-  && mkdir -p memory logs \
+  && mkdir -p memory logs artifacts \
   && docker compose up -d --build \
   && docker compose ps"
