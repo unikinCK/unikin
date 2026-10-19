@@ -130,9 +130,18 @@ Die Sperrliste des Runners prüft nur Text (`"socket"`, `"urllib"` …) und läs
 
 - Der Runner hängt nur im Docker-Netz `sandbox` (`internal: true`) und hat kein Port-Mapping. Er erreicht weder Internet noch DNS, weder den Host (LM Studio) noch das LAN, und von außen ist er nicht erreichbar. Nur der unikin-Container spricht ihn unter `http://runner:8812/mcp` an.
 - Dazu kommen `cap_drop: ALL`, `no-new-privileges`, 768 MB Speicher und 128 Prozesse; im Runner selbst laufen Snippets mit Zeit-, CPU- und Speicherlimits in einem frischen Temp-Verzeichnis.
-- Jeder Aufruf startet ohne Gedächtnis; Unikins eigene Dateien sind für den Runner nicht sichtbar.
+- Jeder Aufruf startet ohne Gedächtnis; Unikins eigene Dateien sind für den Runner nicht sichtbar. Vom Host sieht er nur `artifacts/` (siehe [Erzeugte Dateien](#erzeugte-dateien)).
 
 Auf dem Mac Studio geprüft: Code, der die Sperrliste umgeht, scheitert an `1.1.1.1:443`, `host.docker.internal:1234` und dem LAN mit `Network is unreachable` bzw. ohne Namensauflösung.
+
+### Erzeugte Dateien
+
+Abbildungen (PNG, SVG …) und Berichte (docx, pptx, xlsx, pdf, csv …), die der Code in seinem Arbeitsverzeichnis anlegt, gibt der Runner als Artefakte zurück, höchstens fünf pro Aufruf. Im Docker-Betrieb liegen sie im Projektverzeichnis unter `artifacts/<id>/<datei>` (auf dem Mac Studio `~/unikin/artifacts/`), eingebunden als `/artifacts` im Runner. Sie überleben Neustarts, Rebuilds, `docker compose down` und `./deploy.sh`.
+
+- Das Journal nennt jedes Artefakt als `/artifacts/<id>/<datei>` in der Werkzeugausgabe; derselbe Pfad unter `artifacts/` ist die Datei. Als Link sind sie nicht erreichbar, weil der Runner kein Port-Mapping hat.
+- Ansehen: auf dem Mac Studio mit `open ~/unikin/artifacts` im Finder, vom Laptop aus mit `rsync -a macstudio:unikin/artifacts/ ./artifacts/` (von git und `deploy.sh` ignoriert).
+- Der Runner löscht Artefakt-Ordner, die älter als 7 Tage sind; das ist im Runner-Code fest eingestellt. Was bleiben soll, vorher aus `artifacts/` herauskopieren.
+- Die Dateien stammen aus Code, den das Modell geschrieben hat. Dieser Code kann alles unter `artifacts/` lesen, ändern und löschen, aber nichts sonst auf dem Host.
 
 ### Submodul
 
@@ -167,15 +176,15 @@ Der Agent läuft als Container, LM Studio bleibt nativ auf dem Host (Metal/MLX) 
 ```bash
 git submodule update --init   # Python-Runner unter runner/
 cp .env.example .env          # OPENAI_MODEL anpassen; OPENAI_BASE_URL darf auf localhost bleiben
-mkdir -p memory logs          # Bind-Mounts; müssen vor dem Start existieren
+mkdir -p memory logs artifacts   # Bind-Mounts; müssen vor dem Start existieren
 docker compose up -d --build
 docker compose logs -f
 ```
 
 - Compose startet zwei Container: `unikin` (der Loop) und `unikin-runner` (die Sandbox für `run_python`, siehe [Werkzeuge](#werkzeuge-python-runner)).
-- Ohne `.env` startet Compose absichtlich nicht; ohne `memory/` und `logs/` ebenfalls nicht. Auf Linux-Hosts müssen die beiden Verzeichnisse für UID 1000 beschreibbar sein (der Container läuft nicht als root).
+- Ohne `.env` startet Compose absichtlich nicht; ohne `memory/`, `logs/` und `artifacts/` ebenfalls nicht. Auf Linux-Hosts müssen `memory/` und `logs/` für UID 1000 beschreibbar sein, `artifacts/` für UID 10001 (`sudo chown 10001 artifacts`); die Container laufen nicht als root. Unter Colima ist das nicht nötig.
 - Die Basis-URL setzt `docker-compose.yml` für den Container selbst auf `http://host.docker.internal:1234/v1`; `OPENAI_BASE_URL` in `.env` gilt nur für den nativen Start. Läuft LM Studio auf einem anderen Rechner, `LMSTUDIO_URL=http://<host>:1234/v1` in `.env` setzen.
-- `memory/` und `logs/` sind Bind-Mounts im Projektverzeichnis und überleben Neustarts, Rebuilds und `docker compose down`. `logs/unikin.log` rotiert bei 10 MB (fünf Generationen); der MCP-Server schreibt nach `logs/unikin-mcp.log`.
+- `memory/`, `logs/` und `artifacts/` sind Bind-Mounts im Projektverzeichnis und überleben Neustarts, Rebuilds und `docker compose down`. `logs/unikin.log` rotiert bei 10 MB (fünf Generationen); der MCP-Server schreibt nach `logs/unikin-mcp.log`.
 - Jeder Modellaufruf hat ein Timeout von `OPENAI_TIMEOUT_SECONDS` (Standard 120 s; insgesamt bis zu drei Versuche pro Schritt). `stop_grace_period` (150 s) ist darauf abgestimmt, damit `docker compose stop` einen laufenden Aufruf zu Ende kommen lässt, statt den Agenten hart zu beenden.
 - `restart: unless-stopped`: Der Container kommt nach einem Docker-Neustart von selbst wieder, solange er nicht mit `docker compose stop` angehalten wurde.
 
@@ -183,7 +192,7 @@ docker compose logs -f
 
 ```bash
 docker compose stop     # SIGTERM; in der Wartephase endet der Agent innerhalb einer Sekunde
-docker compose down     # Container entfernen; memory/ und logs/ bleiben erhalten
+docker compose down     # Container entfernen; memory/, logs/ und artifacts/ bleiben erhalten
 ```
 
 Modell wechseln: `OPENAI_MODEL` in `.env` ändern und `docker compose up -d` ausführen (kein Rebuild nötig). Verfügbare IDs liefert `curl http://localhost:1234/v1/models`. Das alte Modell bleibt in LM Studio geladen (bis zum Ablauf seiner TTL, ohne TTL dauerhaft); wer den Platz sofort braucht, entlädt es gezielt mit `lms unload <alte-modell-id>` (nicht `--all`, falls andere Clients LM Studio nutzen).
@@ -199,7 +208,7 @@ Docker (Colima bzw. Docker Desktop) und LM Studio laufen in der Benutzersitzung.
 UNIKIN_HOST=anderer-host UNIKIN_DIR=agents/unikin ./deploy.sh   # Verzeichnis relativ zum Home oder absolut
 ```
 
-Das Skript synchronisiert den Quellcode samt `Dockerfile`, `docker-compose.yml`, `deploy.sh` und dem Runner-Submodul `runner/` (ohne `.git`, `.env`, `memory/`, `logs/`) und führt auf dem Ziel `docker compose up -d --build` aus. Der Mac Studio braucht so keinen Zugang zum privaten Runner-Repository; ist `runner/` leer, bricht das Skript mit einem Hinweis ab. Eine vorhandene `.env` auf dem Ziel bleibt unangetastet; fehlt sie, wird sie aus `.env.example` angelegt. Änderungen an `docker-compose.yml` (z. B. `stop_grace_period`) gehören deshalb ins Repository, nicht auf das Ziel.
+Das Skript synchronisiert den Quellcode samt `Dockerfile`, `docker-compose.yml`, `deploy.sh` und dem Runner-Submodul `runner/` (ohne `.git`, `.env`, `memory/`, `logs/`, `artifacts/`) und führt auf dem Ziel `docker compose up -d --build` aus. Der Mac Studio braucht so keinen Zugang zum privaten Runner-Repository; ist `runner/` leer, bricht das Skript mit einem Hinweis ab. Eine vorhandene `.env` auf dem Ziel bleibt unangetastet; fehlt sie, wird sie aus `.env.example` angelegt. Änderungen an `docker-compose.yml` (z. B. `stop_grace_period`) gehören deshalb ins Repository, nicht auf das Ziel.
 
 ### MCP-Server im Container
 

@@ -62,6 +62,19 @@ services:
     # Erreichbar ist er allein für den unikin-Container unter http://runner:8812/mcp.
     networks:
       - sandbox
+    environment:
+      # Abbildungen und Berichte, die der Code erzeugt, liegen auf dem Host in artifacts/
+      # und überleben so jedes Neuerstellen des Containers (der Runner löscht sie nach 7 Tagen).
+      PYTHON_MCP_ARTIFACT_DIR: /artifacts
+    # Wie memory/ und logs/: muss auf dem Host existieren (mkdir -p artifacts).
+    # Der Runner bleibt UID 10001; unter Colima darf er ohne Rechteanpassung schreiben,
+    # auf Linux-Hosts braucht artifacts/ Schreibrecht für UID 10001.
+    volumes:
+      - type: bind
+        source: ./artifacts
+        target: /artifacts
+        bind:
+          create_host_path: false
     security_opt:
       - no-new-privileges:true
     cap_drop:

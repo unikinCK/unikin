@@ -209,3 +209,4 @@ __marimo__/
 # Unikin runtime state
 memory/
 logs/
+artifacts/
