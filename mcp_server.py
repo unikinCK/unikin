@@ -5,19 +5,22 @@ from __future__ import annotations
 
 import json
 import logging
+import signal
 import sys
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from typing import Any
 
-from openai import OpenAI
-
 from unikin import (
+    LOG_BACKUP_COUNT,
+    LOG_MAX_BYTES,
     build_prompt,
     call_model,
     clean_text,
     compute_interval,
     load_config,
     load_memory,
+    make_client,
     save_memory,
     similarity_score,
 )
@@ -30,10 +33,7 @@ class McpJsonLineServer:
     def __init__(self) -> None:
         self.config = load_config()
         self._setup_logging()
-        self.client = OpenAI(
-            base_url=self.config.openai_base_url,
-            api_key=self.config.openai_api_key,
-        )
+        self.client = make_client(self.config)
         logging.info("MCP-Server gestartet: %s", SERVER_INFO["name"])
 
 
@@ -51,7 +51,14 @@ class McpJsonLineServer:
         stream_handler = logging.StreamHandler(sys.stderr)
         stream_handler.setFormatter(formatter)
 
-        file_handler = logging.FileHandler(self.config.log_file, encoding="utf-8")
+        # Eigene Datei statt der rotierenden Logdatei des Loops: zwei Schreiber mit
+        # eigener Rotation auf derselben Datei würden sich gegenseitig Zeilen verlieren.
+        mcp_log = self.config.log_file.with_name(
+            f"{self.config.log_file.stem}-mcp{self.config.log_file.suffix}"
+        )
+        file_handler = RotatingFileHandler(
+            mcp_log, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+        )
         file_handler.setFormatter(formatter)
 
         root.addHandler(stream_handler)
@@ -219,7 +226,14 @@ class McpJsonLineServer:
                 self._error(request_id, -32000, str(exc))
 
 
+def _handle_sigterm(_signum: int, _frame: Any) -> None:
+    # Als PID 1 im Container würde SIGTERM sonst ignoriert und `docker stop`
+    # erst nach der Karenzzeit hart beenden.
+    raise SystemExit(0)
+
+
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     McpJsonLineServer().serve_forever()
 
 
