@@ -64,8 +64,10 @@ services:
       - sandbox
     environment:
       # Abbildungen und Berichte, die der Code erzeugt, liegen auf dem Host in artifacts/
-      # und überleben so jedes Neuerstellen des Containers (der Runner löscht sie nach 7 Tagen).
+      # und überleben so jedes Neuerstellen des Containers.
       PYTHON_MCP_ARTIFACT_DIR: /artifacts
+      # 0 = der Runner löscht Artefakte nie selbst; aufgeräumt wird von Hand.
+      PYTHON_MCP_ARTIFACT_RETENTION_DAYS: "0"
     # Wie memory/ und logs/: muss auf dem Host existieren (mkdir -p artifacts).
     # Der Runner bleibt UID 10001; unter Colima darf er ohne Rechteanpassung schreiben,
     # auf Linux-Hosts braucht artifacts/ Schreibrecht für UID 10001.
