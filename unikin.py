@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,8 @@ from openai import OpenAI
 JOURNAL_WINDOW = 6
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 
 
 @dataclass
@@ -30,6 +33,7 @@ class AgentConfig:
     openai_base_url: str
     openai_api_key: str
     openai_model: str
+    openai_timeout: float
     identity: str
     mission: str
     min_interval: float
@@ -42,16 +46,34 @@ class AgentConfig:
 class GracefulExit:
     """State holder for signal-based exits."""
 
+    WAIT_SLICE_SECONDS = 0.5
+
     def __init__(self) -> None:
         self.should_stop = False
+        self.signum: int | None = None
 
     def _handle_signal(self, signum: int, _frame: Any) -> None:
-        logging.info("Signal %s empfangen. Fahre kontrolliert herunter ...", signum)
+        # Nur Flags setzen: kein Logging und keine Locks im Signal-Handler.
+        self.signum = signum
         self.should_stop = True
 
     def install(self) -> None:
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
+
+    def wait(self, seconds: float) -> bool:
+        """Wartet bis zu `seconds` in kurzen Scheiben; True, sobald ein Stop-Signal anliegt.
+
+        Ein einzelnes time.sleep() würde nach einem Signal weiterschlafen (PEP 475);
+        so kann z. B. `docker stop` den Agenten innerhalb der Karenzzeit sauber beenden.
+        """
+        deadline = time.monotonic() + seconds
+        while not self.should_stop:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(self.WAIT_SLICE_SECONDS, remaining))
+        return True
 
 
 def to_float(value: str | None, default: float) -> float:
@@ -80,6 +102,7 @@ def load_config() -> AgentConfig:
         openai_base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:1234/v1"),
         openai_api_key=os.getenv("OPENAI_API_KEY", "local-key"),
         openai_model=os.getenv("OPENAI_MODEL", "local-model"),
+        openai_timeout=max(1.0, to_float(os.getenv("OPENAI_TIMEOUT_SECONDS"), 120.0)),
         identity=os.getenv("UNIKIN_IDENTITY", "Unikin"),
         mission=os.getenv(
             "UNIKIN_MISSION",
@@ -108,7 +131,9 @@ def setup_logging(log_path: Path) -> None:
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
 
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+    )
     file_handler.setFormatter(formatter)
 
     root_logger.addHandler(stream_handler)
@@ -157,9 +182,14 @@ def load_memory(config: AgentConfig) -> dict[str, Any]:
 
 def save_memory(config: AgentConfig, state: dict[str, Any]) -> None:
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
-    config.memory_file.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    # Atomar schreiben: ein harter Abbruch (SIGKILL, Stromausfall) darf nie eine
+    # halbe Datei hinterlassen, die load_memory() sonst still reinitialisieren würde.
+    tmp_path = config.memory_file.with_name(f"{config.memory_file.name}.{os.getpid()}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, config.memory_file)
 
 
 def clamp_interval(value: float, config: AgentConfig) -> float:
@@ -303,17 +333,31 @@ def compute_interval(
     return clamp_interval(interval, config)
 
 
+def make_client(config: AgentConfig) -> OpenAI:
+    """OpenAI-Client mit festem Timeout; Wiederholungen übernimmt call_model."""
+    return OpenAI(
+        base_url=config.openai_base_url,
+        api_key=config.openai_api_key,
+        timeout=config.openai_timeout,
+        max_retries=0,
+    )
+
+
 def call_model(
     client: OpenAI,
     model: str,
     system_prompt: str,
     user_prompt: str,
+    stop: GracefulExit | None = None,
 ) -> tuple[dict[str, str], float, bool]:
     start = time.perf_counter()
     raw_text = ""
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
+        if attempt > 1 and stop is not None and stop.should_stop:
+            logging.info("Stop angefordert, keine weiteren API-Versuche.")
+            break
         try:
             response = client.responses.create(
                 model=model,
@@ -347,7 +391,11 @@ def call_model(
                 exc,
             )
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                backoff = RETRY_BACKOFF_SECONDS * attempt
+                if stop is not None:
+                    stop.wait(backoff)
+                else:
+                    time.sleep(backoff)
 
     elapsed = time.perf_counter() - start
     fallback = {
@@ -374,7 +422,7 @@ def run_agent() -> None:
 
     logging.info("Starte %s mit Modell '%s' via %s", config.identity, config.openai_model, config.openai_base_url)
 
-    client = OpenAI(base_url=config.openai_base_url, api_key=config.openai_api_key)
+    client = make_client(config)
 
     while True:
         state = load_memory(config)
@@ -387,7 +435,7 @@ def run_agent() -> None:
         metrics.setdefault("current_interval", config.default_interval)
 
         if exit_flag.should_stop:
-            logging.info("Kontrollierter Shutdown angefordert. Ende.")
+            logging.info("Signal %s empfangen. Kontrollierter Shutdown. Ende.", exit_flag.signum)
             save_memory(config, state)
             break
 
@@ -399,6 +447,7 @@ def run_agent() -> None:
                 model=config.openai_model,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
+                stop=exit_flag,
             )
 
             prev_thought = clean_text(state.get("last_thought", ""))
@@ -458,8 +507,7 @@ def run_agent() -> None:
             logging.info("Thought: %s", result["thought"])
             logging.info("Next focus: %s", result["next_focus"])
 
-            sleep_seconds = max(0.1, new_interval)
-            time.sleep(sleep_seconds)
+            exit_flag.wait(max(0.1, new_interval))
 
         except KeyboardInterrupt:
             logging.info("KeyboardInterrupt empfangen. Fahre herunter ...")
@@ -480,7 +528,7 @@ def run_agent() -> None:
             )
             metrics["current_interval"] = round(fallback_interval, 3)
             save_memory(config, state)
-            time.sleep(max(1.0, fallback_interval))
+            exit_flag.wait(max(1.0, fallback_interval))
 
 
 if __name__ == "__main__":

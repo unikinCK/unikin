@@ -1,0 +1,6 @@
+# Allowlist: nur das, was das Image wirklich braucht.
+*
+!requirements.txt
+!unikin.py
+!mcp_server.py
+!mcp_client.py

@@ -84,7 +84,14 @@ def main() -> None:
             print_json(payload)
 
     finally:
-        proc.terminate()
+        # Erst stdin schließen: der Server beendet sich bei EOF selbst (auch als
+        # `docker compose run`-Container). SIGTERM nur als Rückfallebene.
+        if proc.stdin is not None:
+            proc.stdin.close()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
 
 
 if __name__ == "__main__":
