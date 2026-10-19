@@ -1,240 +1,193 @@
 #!/usr/bin/env python3
-"""Minimal MCP server for Unikin over stdio (JSON-RPC lines)."""
+"""MCP-Server für Unikin über stdio, gebaut auf dem offiziellen MCP-Python-SDK.
+
+Der Server ist eine Schnittstelle zum laufenden Loop: Er liest dessen Gedächtnis und
+legt Nachrichten in die Inbox, schreibt aber nie selbst in unikin_state.json. So bleibt
+der Loop der einzige Schreiber, und parallele Aufrufe überschreiben keinen Zustand.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
 import sys
-from datetime import datetime, timezone
+import time
 from logging.handlers import RotatingFileHandler
-from typing import Any
+from typing import Annotated, Any
+
+import anyio
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from unikin import (
     LOG_BACKUP_COUNT,
     LOG_MAX_BYTES,
-    build_prompt,
-    call_model,
-    clean_text,
-    compute_interval,
+    MAX_MESSAGE_CHARS,
+    MAX_SENDER_CHARS,
+    AgentConfig,
     load_config,
-    load_memory,
-    make_client,
-    save_memory,
-    similarity_score,
+    post_message,
 )
 
-SERVER_INFO = {"name": "unikin-mcp", "version": "0.1.0"}
-PROTOCOL_VERSION = "2024-11-05"
+SERVER_NAME = "unikin"
+SERVER_VERSION = "0.2.0"
+DEFAULT_SENDER = "Mensch"
+JOURNAL_LIMIT = 40
+STEP_POLL_SECONDS = 1.0
+STEP_TIMEOUT_SECONDS = 240
+STEP_MAX_TIMEOUT_SECONDS = 600
+
+INSTRUCTIONS = (
+    "Schnittstelle zum laufenden Unikin-Agenten, einer autonomen Schleife auf einem lokalen Modell. "
+    "get_state und get_journal lesen sein Gedächtnis. send_message legt eine Nachricht in seine Inbox "
+    "und kehrt sofort zurück; step stößt sofort einen Zyklus an und wartet auf dessen Ergebnis. "
+    "Unikins Antwort auf Nachrichten steht im Journal-Eintrag im Feld reply."
+)
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False)
+WRITES_INBOX = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
+
+Sender = Annotated[str, Field(max_length=MAX_SENDER_CHARS, description="Name oder Rolle des Absenders.")]
 
 
-class McpJsonLineServer:
-    def __init__(self) -> None:
-        self.config = load_config()
-        self._setup_logging()
-        self.client = make_client(self.config)
-        logging.info("MCP-Server gestartet: %s", SERVER_INFO["name"])
+def setup_logging(config: AgentConfig) -> None:
+    config.log_file.parent.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # stdout gehört dem MCP-Protokoll. Auf stderr nur Warnungen, damit Clients wie
+    # mcp_client.py die Ausgabe nicht mit Routinemeldungen füllen.
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setLevel(logging.WARNING)
+    stream_handler.setFormatter(formatter)
+
+    # Eigene Datei statt der rotierenden Logdatei des Loops: zwei Schreiber mit
+    # eigener Rotation auf derselben Datei würden sich gegenseitig Zeilen verlieren.
+    mcp_log = config.log_file.with_name(f"{config.log_file.stem}-mcp{config.log_file.suffix}")
+    file_handler = RotatingFileHandler(mcp_log, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+
+    root.addHandler(stream_handler)
+    root.addHandler(file_handler)
 
 
-    def _setup_logging(self) -> None:
-        self.config.log_file.parent.mkdir(parents=True, exist_ok=True)
-        root = logging.getLogger()
-        root.setLevel(logging.INFO)
-        root.handlers.clear()
+def read_state(config: AgentConfig) -> dict[str, Any]:
+    """Liest den Zustand, ohne ihn anzulegen oder zu reparieren; das bleibt Sache des Loops."""
+    try:
+        state = json.loads(config.memory_file.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ToolError("Noch kein Zustand gespeichert: Der Loop hat noch keinen Zyklus abgeschlossen.") from exc
+    except (OSError, ValueError) as exc:
+        raise ToolError(f"Zustand nicht lesbar: {exc}") from exc
+    if not isinstance(state, dict):
+        raise ToolError("Zustand nicht lesbar: kein JSON-Objekt.")
+    return state
 
-        formatter = logging.Formatter(
-            fmt="%(asctime)s | %(levelname)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
 
-        stream_handler = logging.StreamHandler(sys.stderr)
-        stream_handler.setFormatter(formatter)
+def find_cycle(state: dict[str, Any], message_id: str) -> dict[str, Any] | None:
+    for entry in reversed(state.get("journal", [])):
+        if message_id in entry.get("inbox_ids", ()):
+            return entry
+    return None
 
-        # Eigene Datei statt der rotierenden Logdatei des Loops: zwei Schreiber mit
-        # eigener Rotation auf derselben Datei würden sich gegenseitig Zeilen verlieren.
-        mcp_log = self.config.log_file.with_name(
-            f"{self.config.log_file.stem}-mcp{self.config.log_file.suffix}"
-        )
-        file_handler = RotatingFileHandler(
-            mcp_log, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
-        )
-        file_handler.setFormatter(formatter)
 
-        root.addHandler(stream_handler)
-        root.addHandler(file_handler)
+def create_server(config: AgentConfig) -> MCPServer:
+    server = MCPServer(name=SERVER_NAME, title="Unikin", version=SERVER_VERSION, instructions=INSTRUCTIONS)
 
-    def _tool_list(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "name": "unikin.get_state",
-                "description": "Lädt den aktuellen persistierten Unikin-Zustand.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "name": "unikin.step",
-                "description": "Führt einen autonomen Unikin-Reflexionsschritt aus und speichert das Ergebnis.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "note": {
-                            "type": "string",
-                            "description": "Optionaler Hinweis für den Journal-Eintrag.",
-                        }
-                    },
-                    "additionalProperties": False,
-                },
-            },
-        ]
+    @server.tool(title="Zustand lesen", annotations=READ_ONLY)
+    def get_state() -> dict[str, Any]:
+        """Liefert Unikins gespeicherten Zustand: Identität, Mission, letzter Gedanke, nächster Fokus, Metriken und Journal."""
+        return read_state(config)
 
-    def _run_step(self, note: str | None = None) -> dict[str, Any]:
-        state = load_memory(self.config)
-        metrics = state.setdefault("metrics", {})
-        metrics.setdefault("loop_count", 0)
-        metrics.setdefault("error_count", 0)
-        metrics.setdefault("consecutive_errors", 0)
-        metrics.setdefault("consecutive_similar", 0)
-        metrics.setdefault("last_response_seconds", None)
-        metrics.setdefault("current_interval", self.config.default_interval)
+    @server.tool(title="Journal lesen", annotations=READ_ONLY)
+    def get_journal(
+        limit: Annotated[int, Field(ge=1, le=JOURNAL_LIMIT, description="Anzahl der neuesten Einträge.")] = 10,
+    ) -> list[dict[str, Any]]:
+        """Liefert die neuesten Journal-Einträge, ältester zuerst.
 
-        metrics["loop_count"] += 1
-        system_prompt, user_prompt = build_prompt(self.config, state)
-        result, response_seconds, parse_failed = call_model(
-            client=self.client,
-            model=self.config.openai_model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-        )
+        Einträge von Zyklen mit Nachrichten enthalten inbox (die Nachrichten) und reply (Unikins Antwort).
+        """
+        return read_state(config).get("journal", [])[-limit:]
 
-        prev_thought = clean_text(state.get("last_thought", ""))
-        current_thought = clean_text(result["thought"])
-        sim = similarity_score(prev_thought, current_thought)
+    @server.tool(title="Nachricht senden", annotations=WRITES_INBOX)
+    def send_message(
+        text: Annotated[str, Field(min_length=1, max_length=MAX_MESSAGE_CHARS, description="Nachricht an Unikin.")],
+        sender: Sender = DEFAULT_SENDER,
+    ) -> dict[str, Any]:
+        """Legt eine Nachricht in Unikins Inbox und kehrt sofort zurück.
 
-        if sim >= 0.85:
-            metrics["consecutive_similar"] += 1
-        else:
-            metrics["consecutive_similar"] = 0
+        Der laufende Loop wacht davon auf und liest sie im nächsten Zyklus, meist binnen Sekunden;
+        steckt er gerade in einem Modellaufruf, danach. Die Antwort erscheint im Journal (Feld reply).
+        Wer direkt auf die Antwort warten will, nutzt step mit note.
+        """
+        if not text.strip():
+            raise ToolError("text darf nicht leer sein.")
+        message = post_message(config, text, sender)
+        return {"message_id": message["id"], "status": "queued"}
 
-        if parse_failed:
-            metrics["error_count"] += 1
-            metrics["consecutive_errors"] += 1
-        else:
-            metrics["consecutive_errors"] = 0
+    @server.tool(title="Zyklus anstoßen", annotations=WRITES_INBOX)
+    async def step(
+        note: Annotated[
+            str,
+            Field(max_length=MAX_MESSAGE_CHARS, description="Optionale Nachricht, die Unikin in diesem Zyklus liest."),
+        ] = "",
+        sender: Sender = DEFAULT_SENDER,
+        timeout_seconds: Annotated[
+            int, Field(ge=1, le=STEP_MAX_TIMEOUT_SECONDS, description="Wie lange auf das Ergebnis gewartet wird.")
+        ] = STEP_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Stößt sofort einen Zyklus des laufenden Loops an und wartet auf dessen Journal-Eintrag.
 
-        new_interval = compute_interval(
-            config=self.config,
-            current_interval=float(metrics.get("current_interval", self.config.default_interval)),
-            urgency=result["urgency"],
-            consecutive_errors=int(metrics.get("consecutive_errors", 0)),
-            consecutive_similar=int(metrics.get("consecutive_similar", 0)),
-            response_seconds=response_seconds,
-        )
-
-        state["last_thought"] = result["thought"]
-        state["last_state"] = result["state_update"]
-        state["next_focus"] = result["next_focus"]
-        metrics["last_response_seconds"] = round(response_seconds, 3)
-        metrics["current_interval"] = round(new_interval, 3)
-
-        journal = state.setdefault("journal", [])
-        journal.append(
-            {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "thought": result["thought"],
-                "state_update": result["state_update"],
-                "next_focus": result["next_focus"],
-                "urgency": result["urgency"],
-                "similarity": round(sim, 3),
-                "response_seconds": round(response_seconds, 3),
-                "parse_failed": parse_failed,
-                "note": note or "",
-            }
-        )
-        if len(journal) > 40:
-            del journal[:-40]
-
-        save_memory(self.config, state)
-
+        Mit note liest Unikin die Nachricht in genau diesem Zyklus und antwortet im Feld reply.
+        Läuft der Loop nicht oder ist das Modell nicht erreichbar, kommt nach timeout_seconds
+        status "pending" zurück; die Nachricht bleibt dann in der Inbox liegen.
+        """
+        message = post_message(config, note, sender)
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            await anyio.sleep(STEP_POLL_SECONDS)
+            try:
+                entry = find_cycle(read_state(config), message["id"])
+            except ToolError:
+                continue
+            if entry is not None:
+                return {"status": "done", "message_id": message["id"], "entry": entry}
         return {
-            "result": result,
-            "similarity": round(sim, 3),
-            "response_seconds": round(response_seconds, 3),
-            "next_interval_seconds": round(new_interval, 3),
-            "parse_failed": parse_failed,
-            "loop_count": metrics["loop_count"],
+            "status": "pending",
+            "message_id": message["id"],
+            "hint": "Der Loop hat den Zyklus noch nicht abgeschlossen (läuft er, ist LM Studio erreichbar?). "
+            "Das Ergebnis erscheint später im Journal.",
         }
 
-    def _result(self, request_id: Any, payload: Any) -> None:
-        message = {"jsonrpc": "2.0", "id": request_id, "result": payload}
-        sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
-
-    def _error(self, request_id: Any, code: int, message: str) -> None:
-        payload = {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
-
-    def serve_forever(self) -> None:
-        for raw_line in sys.stdin:
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            try:
-                req = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            request_id = req.get("id")
-            method = req.get("method")
-            params = req.get("params", {})
-
-            try:
-                if method == "initialize":
-                    self._result(
-                        request_id,
-                        {
-                            "protocolVersion": PROTOCOL_VERSION,
-                            "serverInfo": SERVER_INFO,
-                            "capabilities": {"tools": {}},
-                        },
-                    )
-                elif method == "ping":
-                    self._result(request_id, {})
-                elif method == "tools/list":
-                    self._result(request_id, {"tools": self._tool_list()})
-                elif method == "tools/call":
-                    name = params.get("name")
-                    arguments = params.get("arguments", {})
-
-                    if name == "unikin.get_state":
-                        state = load_memory(self.config)
-                        self._result(request_id, {"content": [{"type": "json", "json": state}]})
-                    elif name == "unikin.step":
-                        payload = self._run_step(note=arguments.get("note"))
-                        self._result(request_id, {"content": [{"type": "json", "json": payload}]})
-                    else:
-                        self._error(request_id, -32601, f"Unknown tool: {name}")
-                else:
-                    self._error(request_id, -32601, f"Unknown method: {method}")
-            except Exception as exc:  # noqa: BLE001
-                logging.exception("MCP request failed: %s", exc)
-                self._error(request_id, -32000, str(exc))
+    return server
 
 
 def _handle_sigterm(_signum: int, _frame: Any) -> None:
     # Als PID 1 im Container würde SIGTERM sonst ignoriert und `docker stop`
-    # erst nach der Karenzzeit hart beenden.
-    raise SystemExit(0)
+    # erst nach der Karenzzeit hart beenden. SystemExit genügt nicht: Der SDK-Thread,
+    # der stdin liest, blockiert dann das Herunterfahren. Zu sichern gibt es nichts,
+    # Inbox-Dateien entstehen atomar, und die Logdatei wird pro Zeile geschrieben.
+    os._exit(0)
 
 
 def main() -> None:
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    McpJsonLineServer().serve_forever()
+    config = load_config()
+    server = create_server(config)
+    # Erst nach MCPServer(): dessen eigene Logging-Konfiguration wird so ersetzt, nicht verdoppelt.
+    setup_logging(config)
+    logging.info("MCP-Server gestartet: %s %s", SERVER_NAME, SERVER_VERSION)
+    server.run("stdio")
 
 
 if __name__ == "__main__":

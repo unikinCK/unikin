@@ -15,6 +15,8 @@
   - `urgency` (`low|medium|high`)
 - Fallback-Parsing bei fehlerhaftem JSON
 - Adaptive Drosselung zwischen `MIN_INTERVAL_SECONDS` und `MAX_INTERVAL_SECONDS`
+- Inbox für Nachrichten von außen: Eine neue Nachricht weckt den Loop sofort, Unikin antwortet im Feld `reply`
+- Standardkonformer MCP-Server (offizielles MCP-Python-SDK) zum Lesen des Zustands und Senden von Nachrichten
 
 ## Voraussetzungen
 
@@ -55,32 +57,54 @@ LOG_FILE=logs/unikin.log
 ```
 
 
-## MCP Server & MCP Client
+## MCP-Server & MCP-Client
 
-Zusätzlich enthält `unikin` jetzt eine MCP-Integration:
+`mcp_server.py` ist ein MCP-Server nach Spezifikation auf Basis des offiziellen [MCP-Python-SDK](https://github.com/modelcontextprotocol/python-sdk) (`mcp`, Transport stdio). Er ist die Schnittstelle zum laufenden Loop: Er liest dessen Gedächtnis und legt Nachrichten in die Inbox, schreibt aber nie selbst in `unikin_state.json`. Der Loop bleibt so der einzige Schreiber, parallele Aufrufe überschreiben keinen Zustand.
 
-- `mcp_server.py`: Ein lokaler MCP-Server (JSON-RPC über STDIN/STDOUT) mit den Tools:
-  - `unikin.get_state`
-  - `unikin.step`
-- `mcp_client.py`: Ein einfacher CLI-Client, der den Server startet und Tools aufruft.
+| Tool | Wirkung |
+|---|---|
+| `get_state` | Gespeicherter Zustand: Mission, letzter Gedanke, nächster Fokus, Metriken, Journal (nur lesend) |
+| `get_journal` | Die neuesten Journal-Einträge, `limit` 1–40, Standard 10 (nur lesend) |
+| `send_message` | Legt eine Nachricht (`text`, optional `sender`) in die Inbox und kehrt sofort zurück |
+| `step` | Stößt sofort einen Zyklus an, optional mit Nachricht (`note`), und wartet auf dessen Journal-Eintrag (`timeout_seconds`, Standard 240) |
 
-### MCP-Server starten
+### Inbox
+
+Jede Nachricht liegt als eigene Datei in `memory/inbox/`. Eine neue Nachricht weckt den wartenden Loop sofort, frühestens aber `MIN_INTERVAL_SECONDS` nach dem letzten Zyklus; steckt er gerade in einem Modellaufruf, ist sie im Zyklus danach dran. Pro Zyklus liest Unikin bis zu fünf Nachrichten (je höchstens 4000 Zeichen) im Prompt-Feld `inbox` und antwortet im Feld `reply`.
+
+Nachrichten und Antwort landen im Journal-Eintrag des Zyklus (`inbox`, `inbox_ids`, `reply`); erst danach wird die Datei gelöscht. Ist LM Studio nicht erreichbar, bleibt die Nachricht liegen und kommt im nächsten Zyklus erneut. Läuft der Loop gar nicht, liefert `step` nach `timeout_seconds` den Status `pending`. Unlesbare Dateien werden als `.rejected` beiseitegelegt.
+
+### Kommandozeilen-Client
 
 ```bash
-python mcp_server.py
+python mcp_client.py tools                            # Tool-Liste mit Schemas
+python mcp_client.py state                            # gespeicherter Zustand
+python mcp_client.py journal --limit 3                # neueste Journal-Einträge
+python mcp_client.py send "Hallo Unikin"              # Nachricht in die Inbox, kehrt sofort zurück
+python mcp_client.py step --note "Wie geht es dir?"   # Zyklus anstoßen und auf die Antwort warten
 ```
 
-### MCP-Client nutzen
+Der Client startet den Server selbst als Subprozess (`--server-cmd`, Standard: `mcp_server.py` neben dem Client).
+
+### In Claude Code oder Claude Desktop einbinden
+
+Jeder MCP-Client, der stdio-Server starten kann, funktioniert. Für den Container auf dem Mac Studio, vom Laptop aus über SSH (der SSH-Schlüssel muss ohne Rückfrage funktionieren):
 
 ```bash
-# Tool-Liste
-python mcp_client.py tools
+claude mcp add unikin -- ssh macstudio 'cd ~/unikin && PATH="$PATH:/opt/homebrew/bin" docker compose run --rm -T unikin python mcp_server.py'
+```
 
-# Aktuellen Zustand lesen
-python mcp_client.py state
+In Claude Desktop (`claude_desktop_config.json`):
 
-# Einen autonomen Schritt ausführen
-python mcp_client.py step --note "manueller MCP-Trigger"
+```json
+{
+  "mcpServers": {
+    "unikin": {
+      "command": "ssh",
+      "args": ["macstudio", "cd ~/unikin && PATH=\"$PATH:/opt/homebrew/bin\" docker compose run --rm -T unikin python mcp_server.py"]
+    }
+  }
+}
 ```
 
 ## Start
@@ -141,19 +165,20 @@ Das Skript synchronisiert den Quellcode samt `Dockerfile`, `docker-compose.yml` 
 ```bash
 # Client und Server zusammen in einem Einmal-Container (kein Python auf dem Host nötig)
 docker compose run --rm unikin python mcp_client.py state
-docker compose run --rm unikin python mcp_client.py step --note "manueller MCP-Trigger"
+docker compose run --rm unikin python mcp_client.py step --note "Hallo Unikin"
 
-# Oder: Client auf dem Host, MCP-Server als Einmal-Container (stdio über -T)
+# Oder: Client auf dem Host (pip install -r requirements.txt), MCP-Server als Einmal-Container (stdio über -T)
 python3 mcp_client.py --server-cmd "docker compose run --rm -T unikin python mcp_server.py" state
 ```
 
-Hinweis: MCP-Server und Loop-Container teilen sich `memory/unikin_state.json`. Ein `unikin.step` parallel zum laufenden Loop kann sich mit dessen Schreibvorgang überschneiden (letzter Schreiber gewinnt).
+Der Einmal-Container teilt sich `memory/` mit dem Loop-Container: Er liest `unikin_state.json` und legt Nachrichten in `memory/inbox/`, von denen der Loop aufwacht. `step` und `send_message` brauchen deshalb einen laufenden Loop-Container.
 
 ### Fehlersuche
 
 - `Connection error` im Log: Der LM-Studio-Server läuft nicht (`lms server start`) oder lauscht unter Colima nur auf `127.0.0.1`.
 - `Request timed out`: Ein Aufruf hat länger als `OPENAI_TIMEOUT_SECONDS` gedauert, z. B. weil LM Studio ein großes Modell per JIT lädt. Der Agent versucht es bis zu dreimal; bei sehr großen Modellen das Timeout in `.env` erhöhen und `stop_grace_period` in `docker-compose.yml` (im Repository, dann `./deploy.sh`) mitziehen.
 - Reasoning-Modelle (z. B. Qwen 3.6, Nemotron) liefern das JSON im `message`-Teil der Antwort; der Denkteil wird nicht ausgewertet.
+- `step` liefert `pending`: Der Loop-Container läuft nicht (`docker compose ps`) oder LM Studio ist nicht erreichbar. Die Nachricht bleibt in `memory/inbox/` und wird nachgeholt, sobald ein Zyklus das Modell erreicht.
 
 ## Adaptive Drosselung
 
@@ -176,6 +201,7 @@ Zusätzlich wird ein kleiner Jitter genutzt, um starre Polling-Muster zu vermeid
 
 - Memory wird pro Zyklus geladen/aktualisiert/gespeichert.
 - Bei fehlender oder defekter Memory-Datei wird sauber reinitialisiert.
+- Nachrichten an Unikin liegen bis zur Zustellung als einzelne Dateien in `memory/inbox/`.
 - Logs landen sowohl in der Konsole als auch in der Datei `logs/unikin.log`.
 - Ordner werden automatisch angelegt.
 
