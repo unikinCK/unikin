@@ -14,12 +14,17 @@ services:
       # Aus dem Container heraus ist LM Studio der Docker-Host, nicht localhost.
       # OPENAI_BASE_URL in .env gilt nur für den nativen Start; LMSTUDIO_URL überschreibt für Docker.
       OPENAI_BASE_URL: ${LMSTUDIO_URL:-http://host.docker.internal:1234/v1}
+      # Werkzeuge vom Runner im internen Netz; RUNNER_MCP_URL= (leer) in .env schaltet sie ab.
+      RUNNER_MCP_URL: ${RUNNER_MCP_URL-http://runner:8812/mcp}
       # Pfade im Container sind fest, die Daten liegen über die Volumes im Projektordner.
       MEMORY_FILE: /app/memory/unikin_state.json
       LOG_FILE: /app/logs/unikin.log
     extra_hosts:
       # Für Docker auf Linux nötig; Docker Desktop und Colima lösen den Namen auch ohne auf.
       - "host.docker.internal:host-gateway"
+    networks:
+      - default  # Weg zu LM Studio auf dem Host
+      - sandbox  # nur zum Runner
     # Die Verzeichnisse müssen auf dem Host existieren (mkdir -p memory logs): so
     # legt Docker sie weder als root an (Linux) noch unsichtbar in der VM (Colima).
     volumes:
@@ -45,3 +50,33 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  runner:
+    # python-http-mcp-runner, als Git-Submodul eingebunden (git submodule update --init).
+    # Er führt den Code aus, den das Modell schreibt; der Runner-Code bleibt unverändert.
+    build: ./runner
+    image: unikin-runner:local
+    container_name: unikin-runner
+    restart: unless-stopped
+    # Nur im internen Netz und ohne Port-Mapping: kein Internet, kein LAN, kein Host.
+    # Erreichbar ist er allein für den unikin-Container unter http://runner:8812/mcp.
+    networks:
+      - sandbox
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          pids: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  sandbox:
+    internal: true

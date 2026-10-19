@@ -10,8 +10,19 @@ import pytest
 import unikin
 
 
+class FakeItem(SimpleNamespace):
+    """Ausgabe-Element einer Responses-API-Antwort."""
+
+    def model_dump(self, **_: Any) -> dict[str, Any]:
+        return dict(vars(self))
+
+
 class FakeModel:
-    """Steht für den OpenAI-Client: liefert eine feste JSON-Antwort und merkt sich die Prompts."""
+    """Steht für den OpenAI-Client: liefert eine feste JSON-Antwort und merkt sich die Prompts.
+
+    Solange `tool_requests` Einträge hat und Werkzeuge angeboten werden, antwortet er
+    stattdessen mit einem Werkzeugaufruf (name, arguments als dict oder Rohtext).
+    """
 
     def __init__(self) -> None:
         self.payload: dict[str, Any] = {
@@ -21,6 +32,7 @@ class FakeModel:
             "urgency": "medium",
         }
         self.error: Exception | None = None
+        self.tool_requests: list[tuple[str, dict[str, Any] | str]] = []
         self.requests: list[dict[str, Any]] = []
         self.responses = self
 
@@ -28,7 +40,19 @@ class FakeModel:
         self.requests.append(kwargs)
         if self.error is not None:
             raise self.error
-        return SimpleNamespace(output_text=json.dumps(self.payload, ensure_ascii=False))
+        if self.tool_requests and kwargs.get("tools"):
+            name, arguments = self.tool_requests.pop(0)
+            call = FakeItem(
+                type="function_call",
+                name=name,
+                arguments=arguments if isinstance(arguments, str) else json.dumps(arguments),
+                call_id=f"call_{len(self.requests)}",
+            )
+            return SimpleNamespace(output=[call], output_text="")
+        return SimpleNamespace(
+            output=[FakeItem(type="message")],
+            output_text=json.dumps(self.payload, ensure_ascii=False),
+        )
 
     def user_payload(self, index: int = -1) -> dict[str, Any]:
         return json.loads(self.requests[index]["input"][1]["content"])

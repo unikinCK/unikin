@@ -17,6 +17,7 @@
 - Adaptive Drosselung zwischen `MIN_INTERVAL_SECONDS` und `MAX_INTERVAL_SECONDS`
 - Inbox für Nachrichten von außen: Eine neue Nachricht weckt den Loop sofort, Unikin antwortet im Feld `reply`
 - Standardkonformer MCP-Server (offizielles MCP-Python-SDK) zum Lesen des Zustands und Senden von Nachrichten
+- Werkzeug `run_python`: Unikin führt Python-Code in einer netzwerkisolierten Sandbox aus (python-http-mcp-runner per MCP)
 
 ## Voraussetzungen
 
@@ -107,11 +108,49 @@ In Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
+## Werkzeuge: Python-Runner
+
+Unikin kann Python-Code ausführen. Das Werkzeug liefert der [python-http-mcp-runner](https://github.com/unikinCK/python-http-mcp-runner) (privat), ein MCP-Server über Streamable HTTP mit dem Tool `run_python`. Er ist als Git-Submodul unter `runner/` eingebunden und läuft im Docker-Betrieb als eigener Container neben Unikin.
+
+So läuft ein Zyklus mit Werkzeugen:
+
+1. Unikin holt die Tool-Liste vom Runner und bietet sie dem Modell an (Responses-API, Function Calling).
+2. Ruft das Modell ein Werkzeug auf, führt Unikin den Aufruf über MCP aus und gibt die Ausgabe zurück. Das wiederholt sich, bis das Modell mit seinem JSON antwortet.
+3. Pro Zyklus sind höchstens `MAX_TOOL_CALLS_PER_CYCLE` Aufrufe erlaubt (Standard 3). Ist das Budget aufgebraucht, stellt Unikin eine frische Schlussanfrage ohne Werkzeuge, in der die Ergebnisse als `tool_results` stehen. Qwen ruft nach einem Werkzeugergebnis sonst weiter Werkzeuge auf (auch mit `tool_choice: "none"`) oder denkt ohne angebotene Werkzeuge endlos nach.
+4. Code und Ausgabe landen gekürzt im Journal-Eintrag (`tool_calls`). Ist der Runner nicht erreichbar, läuft der Zyklus ohne Werkzeuge weiter.
+
+| Variable | Bedeutung |
+|---|---|
+| `RUNNER_MCP_URL` | MCP-Endpunkt des Runners. Im Docker-Betrieb setzt `docker-compose.yml` `http://runner:8812/mcp`; leer (`RUNNER_MCP_URL=` in `.env`) schaltet die Werkzeuge ab |
+| `MAX_TOOL_CALLS_PER_CYCLE` | Höchstzahl der Werkzeugaufrufe pro Zyklus (Standard 3, `0` schaltet ab) |
+
+### Isolation
+
+Die Sperrliste des Runners prüft nur Text (`"socket"`, `"urllib"` …) und lässt sich umgehen, etwa mit `importlib.import_module("sock" + "et")`. Für einen Agenten, der unbeaufsichtigt Code schreibt, sichert deshalb das Netz ab:
+
+- Der Runner hängt nur im Docker-Netz `sandbox` (`internal: true`) und hat kein Port-Mapping. Er erreicht weder Internet noch DNS, weder den Host (LM Studio) noch das LAN, und von außen ist er nicht erreichbar. Nur der unikin-Container spricht ihn unter `http://runner:8812/mcp` an.
+- Dazu kommen `cap_drop: ALL`, `no-new-privileges`, 768 MB Speicher und 128 Prozesse; im Runner selbst laufen Snippets mit Zeit-, CPU- und Speicherlimits in einem frischen Temp-Verzeichnis.
+- Jeder Aufruf startet ohne Gedächtnis; Unikins eigene Dateien sind für den Runner nicht sichtbar.
+
+Auf dem Mac Studio geprüft: Code, der die Sperrliste umgeht, scheitert an `1.1.1.1:443`, `host.docker.internal:1234` und dem LAN mit `Network is unreachable` bzw. ohne Namensauflösung.
+
+### Submodul
+
+```bash
+git clone --recurse-submodules https://github.com/unikinCK/unikin.git
+# oder in einer bestehenden Kopie (auch in jedem neuen Worktree):
+git submodule update --init
+```
+
+Neue Runner-Version übernehmen: `git -C runner pull origin main`, dann `git add runner` und committen.
+
 ## Start
 
 ```bash
 python unikin.py
 ```
+
+Nativ gestartet nutzt Unikin Werkzeuge nur, wenn `RUNNER_MCP_URL` in `.env` auf einen laufenden Runner zeigt.
 
 ## Docker (Mac Studio + LM Studio)
 
@@ -126,12 +165,14 @@ Der Agent läuft als Container, LM Studio bleibt nativ auf dem Host (Metal/MLX) 
 ### Starten
 
 ```bash
+git submodule update --init   # Python-Runner unter runner/
 cp .env.example .env          # OPENAI_MODEL anpassen; OPENAI_BASE_URL darf auf localhost bleiben
 mkdir -p memory logs          # Bind-Mounts; müssen vor dem Start existieren
 docker compose up -d --build
 docker compose logs -f
 ```
 
+- Compose startet zwei Container: `unikin` (der Loop) und `unikin-runner` (die Sandbox für `run_python`, siehe [Werkzeuge](#werkzeuge-python-runner)).
 - Ohne `.env` startet Compose absichtlich nicht; ohne `memory/` und `logs/` ebenfalls nicht. Auf Linux-Hosts müssen die beiden Verzeichnisse für UID 1000 beschreibbar sein (der Container läuft nicht als root).
 - Die Basis-URL setzt `docker-compose.yml` für den Container selbst auf `http://host.docker.internal:1234/v1`; `OPENAI_BASE_URL` in `.env` gilt nur für den nativen Start. Läuft LM Studio auf einem anderen Rechner, `LMSTUDIO_URL=http://<host>:1234/v1` in `.env` setzen.
 - `memory/` und `logs/` sind Bind-Mounts im Projektverzeichnis und überleben Neustarts, Rebuilds und `docker compose down`. `logs/unikin.log` rotiert bei 10 MB (fünf Generationen); der MCP-Server schreibt nach `logs/unikin-mcp.log`.
@@ -158,7 +199,7 @@ Docker (Colima bzw. Docker Desktop) und LM Studio laufen in der Benutzersitzung.
 UNIKIN_HOST=anderer-host UNIKIN_DIR=agents/unikin ./deploy.sh   # Verzeichnis relativ zum Home oder absolut
 ```
 
-Das Skript synchronisiert den Quellcode samt `Dockerfile`, `docker-compose.yml` und `deploy.sh` (ohne `.git`, `.env`, `memory/`, `logs/`) und führt auf dem Ziel `docker compose up -d --build` aus. Eine vorhandene `.env` auf dem Ziel bleibt unangetastet; fehlt sie, wird sie aus `.env.example` angelegt. Änderungen an `docker-compose.yml` (z. B. `stop_grace_period`) gehören deshalb ins Repository, nicht auf das Ziel.
+Das Skript synchronisiert den Quellcode samt `Dockerfile`, `docker-compose.yml`, `deploy.sh` und dem Runner-Submodul `runner/` (ohne `.git`, `.env`, `memory/`, `logs/`) und führt auf dem Ziel `docker compose up -d --build` aus. Der Mac Studio braucht so keinen Zugang zum privaten Runner-Repository; ist `runner/` leer, bricht das Skript mit einem Hinweis ab. Eine vorhandene `.env` auf dem Ziel bleibt unangetastet; fehlt sie, wird sie aus `.env.example` angelegt. Änderungen an `docker-compose.yml` (z. B. `stop_grace_period`) gehören deshalb ins Repository, nicht auf das Ziel.
 
 ### MCP-Server im Container
 
@@ -178,6 +219,7 @@ Der Einmal-Container teilt sich `memory/` mit dem Loop-Container: Er liest `unik
 - `Connection error` im Log: Der LM-Studio-Server läuft nicht (`lms server start`) oder lauscht unter Colima nur auf `127.0.0.1`.
 - `Request timed out`: Ein Aufruf hat länger als `OPENAI_TIMEOUT_SECONDS` gedauert, z. B. weil LM Studio ein großes Modell per JIT lädt. Der Agent versucht es bis zu dreimal; bei sehr großen Modellen das Timeout in `.env` erhöhen und `stop_grace_period` in `docker-compose.yml` (im Repository, dann `./deploy.sh`) mitziehen.
 - Reasoning-Modelle (z. B. Qwen 3.6, Nemotron) liefern das JSON im `message`-Teil der Antwort; der Denkteil wird nicht ausgewertet.
+- `Python-Runner nicht erreichbar, dieser Zyklus läuft ohne Werkzeuge` im Log: Der Runner-Container läuft nicht (`docker compose ps`, `docker compose logs runner`). Unikin arbeitet ohne Werkzeuge weiter und versucht es jeden Zyklus erneut.
 - `step` liefert `pending`: Der Loop-Container läuft nicht (`docker compose ps`) oder LM Studio ist nicht erreichbar. Die Nachricht bleibt in `memory/inbox/` und wird nachgeholt, sobald ein Zyklus das Modell erreicht.
 
 ## Adaptive Drosselung

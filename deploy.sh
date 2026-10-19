@@ -19,11 +19,17 @@ esac
 
 cd "$(dirname "$0")"
 
+# Der Python-Runner ist ein Git-Submodul; ohne ihn schlägt der Build auf dem Ziel fehl.
+if [ ! -f runner/Dockerfile ]; then
+  echo "runner/ ist leer: zuerst 'git submodule update --init' ausführen." >&2
+  exit 1
+fi
+
 $SSH "$HOST" "mkdir -p '$DIR'"
 
 rsync -a -e "$SSH" \
   --exclude .git --exclude .github --exclude .claude \
-  --exclude .venv --exclude venv --exclude __pycache__ \
+  --exclude .venv --exclude venv --exclude __pycache__ --exclude .pytest_cache \
   --exclude .env --exclude memory --exclude logs \
   ./ "$HOST:$DIR/"
 

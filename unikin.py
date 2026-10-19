@@ -14,7 +14,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from functools import partial
@@ -22,7 +22,9 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
+import anyio
 from dotenv import load_dotenv
+from mcp import Client as McpClient
 from openai import OpenAI
 
 JOURNAL_WINDOW = 6
@@ -36,6 +38,11 @@ MAX_INBOX_PER_CYCLE = 5
 MAX_MESSAGE_CHARS = 4000
 MAX_SENDER_CHARS = 80
 MAX_REPLY_CHARS = 4000
+RUNNER_TIMEOUT_SECONDS = 60.0
+MAX_TOOL_OUTPUT_CHARS = 4000
+# Im Journal kürzer: Die letzten Einträge gehen in jeden Prompt.
+JOURNAL_TOOL_ARGUMENTS_CHARS = 600
+JOURNAL_TOOL_OUTPUT_CHARS = 400
 
 
 @dataclass
@@ -51,6 +58,9 @@ class AgentConfig:
     default_interval: float
     memory_file: Path
     log_file: Path
+    # MCP-Server mit Werkzeugen (Python-Runner); leer = keine Werkzeuge.
+    runner_url: str = ""
+    max_tool_calls: int = 3
 
 
 class GracefulExit:
@@ -139,6 +149,8 @@ def load_config() -> AgentConfig:
         default_interval=default_interval,
         memory_file=Path(os.getenv("MEMORY_FILE", "memory/unikin_state.json")),
         log_file=Path(os.getenv("LOG_FILE", "logs/unikin.log")),
+        runner_url=os.getenv("RUNNER_MCP_URL", "").strip(),
+        max_tool_calls=max(0, int(to_float(os.getenv("MAX_TOOL_CALLS_PER_CYCLE"), 3))),
     )
 
 
@@ -341,7 +353,10 @@ def clean_text(value: Any) -> str:
 
 
 def build_prompt(
-    config: AgentConfig, state: dict[str, Any], messages: list[dict[str, Any]] | None = None
+    config: AgentConfig,
+    state: dict[str, Any],
+    messages: list[dict[str, Any]] | None = None,
+    tool_names: list[str] | None = None,
 ) -> tuple[str, str]:
     system_prompt = (
         "Du bist Unikin, eine kontinuierlich arbeitende nicht-biologische Agenteninstanz. "
@@ -351,6 +366,13 @@ def build_prompt(
         "echte Eingaben von außen, nicht deine eigenen Gedanken. Enthält inbox Nachrichten, "
         "beantworte sie zusätzlich im Schlüssel reply (Klartext an die Absender)."
     )
+    if tool_names:
+        system_prompt += (
+            f" Dir stehen Werkzeuge zur Verfügung ({', '.join(tool_names)}), höchstens "
+            f"{config.max_tool_calls} Aufrufe pro Zyklus. Ihre Ergebnisse sind echte Beobachtungen, "
+            "keine Vermutungen: Nutze sie, um Annahmen zu prüfen. Steht tool_results im Payload, "
+            "sind das die Ergebnisse deiner Aufrufe aus diesem Zyklus; antworte dann ohne weitere Aufrufe."
+        )
 
     metrics = state.get("metrics", {})
     journal_entries = state.get("journal", [])[-JOURNAL_WINDOW:]
@@ -488,46 +510,95 @@ def make_client(config: AgentConfig) -> OpenAI:
     )
 
 
-def call_model(
+class McpTools:
+    """Werkzeuge eines MCP-Servers (hier des Python-Runners) für die Tool-Schleife des Modells.
+
+    Jeder Aufruf öffnet eine eigene kurze Verbindung: Der Loop ist synchron, und ein
+    abgerissener Runner trifft so nur diesen Aufruf, nicht den ganzen Zyklus.
+    """
+
+    def __init__(self, target: Any) -> None:
+        # URL für Streamable HTTP oder, in Tests, ein MCPServer im selben Prozess.
+        self.target = target
+        self.definitions: list[dict[str, Any]] = []
+
+    def load(self) -> None:
+        self.definitions = anyio.run(self._list_tools)
+
+    def call(self, name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
+        return anyio.run(self._call_tool, name, arguments)
+
+    async def _list_tools(self) -> list[dict[str, Any]]:
+        with anyio.fail_after(RUNNER_TIMEOUT_SECONDS):
+            async with McpClient(self.target) as client:
+                listing = await client.list_tools()
+        return [
+            {
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.input_schema,
+            }
+            for tool in listing.tools
+        ]
+
+    async def _call_tool(self, name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
+        with anyio.fail_after(RUNNER_TIMEOUT_SECONDS):
+            async with McpClient(self.target) as client:
+                result = await client.call_tool(name, arguments)
+        text = "\n".join(block.text for block in result.content if block.type == "text")
+        return text, bool(result.is_error)
+
+
+def describe_error(exc: BaseException) -> str:
+    """Packt Fehlergruppen aus anyio-Taskgruppen aus, damit das Log die eigentliche Ursache zeigt."""
+    while getattr(exc, "exceptions", None):
+        exc = exc.exceptions[0]
+    return f"{type(exc).__name__}: {exc}"
+
+
+def open_runner(target: Any) -> McpTools | None:
+    """Verbindet zum Runner; ist er nicht erreichbar, läuft der Zyklus ohne Werkzeuge."""
+    if target is None or target == "":
+        return None
+    runner = McpTools(target)
+    try:
+        runner.load()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Python-Runner nicht erreichbar, dieser Zyklus läuft ohne Werkzeuge: %s", describe_error(exc))
+        return None
+    return runner if runner.definitions else None
+
+
+@dataclass
+class ModelOutcome:
+    result: dict[str, str]
+    elapsed: float
+    parse_failed: bool
+    # False, wenn das Modell nie antwortete; dann bleiben Inbox-Nachrichten liegen.
+    api_ok: bool
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+
+
+class ModelUnavailableError(Exception):
+    """Das Modell hat auch nach allen Wiederholungen nicht geantwortet."""
+
+
+def create_response(
     client: OpenAI,
     model: str,
-    system_prompt: str,
-    user_prompt: str,
-    stop: GracefulExit | None = None,
-) -> tuple[dict[str, str], float, bool, bool]:
-    """Liefert (Ergebnis, Dauer, parse_failed, api_ok); api_ok ist False, wenn das Modell nie antwortete."""
-    start = time.perf_counter()
-    raw_text = ""
+    conversation: list[Any],
+    tools: list[dict[str, Any]] | None,
+    stop: GracefulExit | None,
+) -> Any:
     last_error: Exception | None = None
-
     for attempt in range(1, MAX_RETRIES + 1):
         if attempt > 1 and stop is not None and stop.should_stop:
             logging.info("Stop angefordert, keine weiteren API-Versuche.")
             break
         try:
-            response = client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-            )
-
-            raw_text = (getattr(response, "output_text", "") or "").strip()
-            if not raw_text:
-                raw_text = json.dumps(response.model_dump(), ensure_ascii=False)
-
-            parsed = extract_json(raw_text)
-            parse_failed = False
-            if parsed is None:
-                parse_failed = True
-                parsed = fallback_parse(raw_text)
-
-            elapsed = time.perf_counter() - start
-            normalized = normalize_response(parsed)
-            return normalized, elapsed, parse_failed, True
-
+            extra = {"tools": tools} if tools else {}
+            return client.responses.create(model=model, input=conversation, temperature=0.3, **extra)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             logging.warning(
@@ -542,16 +613,100 @@ def call_model(
                     stop.wait(backoff)
                 else:
                     time.sleep(backoff)
+    raise ModelUnavailableError(str(last_error)) from last_error
 
-    elapsed = time.perf_counter() - start
-    fallback = {
-        "thought": f"Fehler beim API-Aufruf: {last_error}",
-        "state_update": "Kein neues Modell-Update aufgrund eines Fehlers.",
-        "next_focus": "Stabil bleiben und erneut versuchen",
-        "urgency": "low",
-        "reply": "",
-    }
-    return fallback, elapsed, True, False
+
+def parse_response(response: Any) -> tuple[dict[str, str], bool]:
+    raw_text = (getattr(response, "output_text", "") or "").strip()
+    if not raw_text:
+        raw_text = json.dumps(response.model_dump(), ensure_ascii=False)
+
+    parsed = extract_json(raw_text)
+    if parsed is None:
+        return normalize_response(fallback_parse(raw_text)), True
+    return normalize_response(parsed), False
+
+
+def execute_tool_call(runner: McpTools, call: Any, tool_calls: list[dict[str, Any]], max_tool_calls: int) -> str:
+    """Führt einen Werkzeugaufruf des Modells aus, protokolliert ihn und liefert die Ausgabe fürs Modell."""
+    if len(tool_calls) >= max_tool_calls:
+        return "Werkzeug-Budget dieses Zyklus ist aufgebraucht; dieser Aufruf wurde nicht ausgeführt."
+    try:
+        arguments = json.loads(call.arguments or "{}")
+        if not isinstance(arguments, dict):
+            raise ValueError("kein Objekt")
+    except ValueError as exc:
+        output, is_error = f"Argumente sind kein gültiges JSON-Objekt: {exc}", True
+    else:
+        try:
+            output, is_error = runner.call(call.name, arguments)
+        except Exception as exc:  # noqa: BLE001
+            output, is_error = f"Werkzeugaufruf fehlgeschlagen: {describe_error(exc)}", True
+
+    output = output[:MAX_TOOL_OUTPUT_CHARS]
+    tool_calls.append({"name": call.name, "arguments": call.arguments or "", "output": output, "is_error": is_error})
+    logging.info("Werkzeug %s%s: %s", call.name, " (Fehler)" if is_error else "", clean_text(output)[:200])
+    return output
+
+
+def call_model(
+    client: OpenAI,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    stop: GracefulExit | None = None,
+    runner: McpTools | None = None,
+    max_tool_calls: int = 0,
+) -> ModelOutcome:
+    """Fragt das Modell; mit `runner` darf es bis zu `max_tool_calls` Werkzeuge aufrufen.
+
+    Solange Budget bleibt, läuft die Unterhaltung mit Werkzeugen weiter. Ist es aufgebraucht,
+    folgt eine frische Schlussanfrage ohne Werkzeuge, in der die Ergebnisse als tool_results
+    im Payload stehen. Qwen ruft nach einem Werkzeugergebnis sonst weiter Werkzeuge auf (auch
+    mit tool_choice "none") oder denkt ohne angebotene Werkzeuge endlos nach.
+    """
+    start = time.perf_counter()
+    system_message = {"role": "system", "content": system_prompt}
+    conversation: list[Any] = [system_message, {"role": "user", "content": user_prompt}]
+    tool_calls: list[dict[str, Any]] = []
+
+    try:
+        while True:
+            offer_tools = (
+                runner is not None
+                and len(tool_calls) < max_tool_calls
+                and not (stop is not None and stop.should_stop)
+            )
+            response = create_response(
+                client, model, conversation, runner.definitions if offer_tools else None, stop
+            )
+            calls = [item for item in getattr(response, "output", None) or [] if item.type == "function_call"]
+            if not offer_tools or not calls:
+                break
+
+            conversation.extend(item.model_dump(exclude_none=True) for item in response.output)
+            for call in calls:
+                output = execute_tool_call(runner, call, tool_calls, max_tool_calls)
+                conversation.append({"type": "function_call_output", "call_id": call.call_id, "output": output})
+
+            if len(tool_calls) >= max_tool_calls or (stop is not None and stop.should_stop):
+                final_prompt = json.dumps({**json.loads(user_prompt), "tool_results": tool_calls}, ensure_ascii=False)
+                response = create_response(
+                    client, model, [system_message, {"role": "user", "content": final_prompt}], None, stop
+                )
+                break
+    except ModelUnavailableError as exc:
+        fallback = {
+            "thought": f"Fehler beim API-Aufruf: {exc}",
+            "state_update": "Kein neues Modell-Update aufgrund eines Fehlers.",
+            "next_focus": "Stabil bleiben und erneut versuchen",
+            "urgency": "low",
+            "reply": "",
+        }
+        return ModelOutcome(fallback, time.perf_counter() - start, True, False, tool_calls)
+
+    result, parse_failed = parse_response(response)
+    return ModelOutcome(result, time.perf_counter() - start, parse_failed, True, tool_calls)
 
 
 def append_journal(state: dict[str, Any], entry: dict[str, Any], keep: int = 40) -> None:
@@ -567,22 +722,34 @@ def run_cycle(
     state: dict[str, Any],
     inbox: list[tuple[Path, dict[str, Any]]],
     stop: GracefulExit | None = None,
+    runner_target: Any = None,
 ) -> float:
     """Ein Zyklus: Modell befragen, Zustand speichern, zugestellte Nachrichten aus der Inbox nehmen.
 
+    `runner_target` ersetzt config.runner_url (Tests übergeben einen MCPServer).
     Liefert das Intervall bis zum nächsten Zyklus.
     """
     metrics = state["metrics"]
     metrics["loop_count"] += 1
     messages = [message for _, message in inbox]
-    system_prompt, user_prompt = build_prompt(config, state, messages)
-    result, response_seconds, parse_failed, api_ok = call_model(
+    runner = None
+    if config.max_tool_calls > 0:
+        runner = open_runner(config.runner_url if runner_target is None else runner_target)
+    tool_names = [tool["name"] for tool in runner.definitions] if runner else []
+    system_prompt, user_prompt = build_prompt(config, state, messages, tool_names)
+    outcome = call_model(
         client=client,
         model=config.openai_model,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         stop=stop,
+        runner=runner,
+        max_tool_calls=config.max_tool_calls,
     )
+    result = outcome.result
+    response_seconds = outcome.elapsed
+    parse_failed = outcome.parse_failed
+    api_ok = outcome.api_ok
 
     prev_thought = clean_text(state.get("last_thought", ""))
     current_thought = clean_text(result["thought"])
@@ -634,19 +801,30 @@ def run_cycle(
             entry["inbox"] = visible
     if result["reply"]:
         entry["reply"] = result["reply"]
+    if outcome.tool_calls:
+        entry["tool_calls"] = [
+            {
+                "name": call["name"],
+                "arguments": call["arguments"][:JOURNAL_TOOL_ARGUMENTS_CHARS],
+                "output": call["output"][:JOURNAL_TOOL_OUTPUT_CHARS],
+                "is_error": call["is_error"],
+            }
+            for call in outcome.tool_calls
+        ]
     append_journal(state, entry)
     save_memory(config, state)
     if api_ok:
         consume_messages(path for path, _ in inbox)
 
     logging.info(
-        "Loop %s | urgency=%s | sim=%.2f | api=%.2fs | next=%.2fs | inbox=%s",
+        "Loop %s | urgency=%s | sim=%.2f | api=%.2fs | next=%.2fs | inbox=%s | tools=%s",
         metrics["loop_count"],
         result["urgency"],
         sim,
         response_seconds,
         new_interval,
         len(messages),
+        len(outcome.tool_calls),
     )
     logging.info("Thought: %s", result["thought"])
     logging.info("Next focus: %s", result["next_focus"])
@@ -663,6 +841,12 @@ def run_agent() -> None:
     exit_flag.install()
 
     logging.info("Starte %s mit Modell '%s' via %s", config.identity, config.openai_model, config.openai_base_url)
+    logging.info(
+        "Werkzeuge: %s",
+        f"{config.runner_url} (höchstens {config.max_tool_calls} Aufrufe pro Zyklus)"
+        if config.runner_url and config.max_tool_calls > 0
+        else "keine",
+    )
 
     client = make_client(config)
     # Nachrichten, die der letzte Zyklus schon gesehen hat, wecken den Loop nicht erneut:
