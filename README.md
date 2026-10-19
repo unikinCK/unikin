@@ -165,7 +165,7 @@ So läuft ein Zyklus mit Werkzeugen:
 
 1. Unikin holt die Tool-Liste vom Runner und bietet sie dem Modell an (Responses-API, Function Calling).
 2. Ruft das Modell ein Werkzeug auf, führt Unikin den Aufruf über MCP aus und gibt die Ausgabe zurück. Das wiederholt sich, bis das Modell mit seinem JSON antwortet.
-3. Pro Zyklus sind höchstens `MAX_TOOL_CALLS_PER_CYCLE` Aufrufe erlaubt (Standard 3). Ist das Budget aufgebraucht, stellt Unikin eine frische Schlussanfrage ohne Werkzeuge, in der die Ergebnisse als `tool_results` stehen. Qwen ruft nach einem Werkzeugergebnis sonst weiter Werkzeuge auf (auch mit `tool_choice: "none"`) oder denkt ohne angebotene Werkzeuge endlos nach.
+3. Pro Zyklus sind höchstens `MAX_TOOL_CALLS_PER_CYCLE` Aufrufe erlaubt (Standard 3). Ist das Budget aufgebraucht, stellt Unikin eine frische Schlussanfrage ohne Werkzeuge, in der die Ergebnisse als `tool_results` stehen. Qwen ruft nach einem Werkzeugergebnis sonst weiter Werkzeuge auf (auch mit `tool_choice: "none"`) oder denkt ohne angebotene Werkzeuge endlos nach. Dieselbe Schlussanfrage stellt Unikin auch, wenn das Modell nach Werkzeugaufrufen von selbst aufhört, aber nicht mit JSON antwortet (etwa mit Zeilen wie `thought: "…"`). Ohne Werkzeugaufrufe bleibt es bei einer Anfrage.
 4. Code und Ausgabe landen gekürzt im Journal-Eintrag (`tool_calls`). Ist der Runner nicht erreichbar, läuft der Zyklus ohne Werkzeuge weiter.
 
 | Variable | Bedeutung |

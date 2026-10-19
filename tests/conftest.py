@@ -21,7 +21,8 @@ class FakeModel:
     """Steht für den OpenAI-Client: liefert eine feste JSON-Antwort und merkt sich die Prompts.
 
     Solange `tool_requests` Einträge hat und Werkzeuge angeboten werden, antwortet er
-    stattdessen mit einem Werkzeugaufruf (name, arguments als dict oder Rohtext).
+    stattdessen mit einem Werkzeugaufruf (name, arguments als dict oder Rohtext). Danach
+    liefert er der Reihe nach die Texte aus `raw_outputs` statt JSON, jeden einmal.
     """
 
     def __init__(self) -> None:
@@ -33,6 +34,7 @@ class FakeModel:
         }
         self.error: Exception | None = None
         self.tool_requests: list[tuple[str, dict[str, Any] | str]] = []
+        self.raw_outputs: list[str] = []
         self.requests: list[dict[str, Any]] = []
         self.responses = self
 
@@ -49,6 +51,8 @@ class FakeModel:
                 call_id=f"call_{len(self.requests)}",
             )
             return SimpleNamespace(output=[call], output_text="")
+        if self.raw_outputs:
+            return SimpleNamespace(output=[FakeItem(type="message")], output_text=self.raw_outputs.pop(0))
         return SimpleNamespace(
             output=[FakeItem(type="message")],
             output_text=json.dumps(self.payload, ensure_ascii=False),
