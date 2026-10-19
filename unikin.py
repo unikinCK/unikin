@@ -369,8 +369,10 @@ def build_prompt(
     if tool_names:
         system_prompt += (
             f" Dir stehen Werkzeuge zur Verfügung ({', '.join(tool_names)}), höchstens "
-            f"{config.max_tool_calls} Aufrufe pro Zyklus. Ihre Ergebnisse sind echte Beobachtungen, "
-            "keine Vermutungen: Nutze sie, um Annahmen zu prüfen. Steht tool_results im Payload, "
+            f"{config.max_tool_calls} Aufrufe pro Zyklus. Sie sind ein Angebot, keine Pflicht: Rufe "
+            "ein Werkzeug nur auf, wenn du sein Ergebnis wirklich brauchst. Ihre Ergebnisse sind echte "
+            "Beobachtungen, keine Vermutungen: Nutze sie, um Annahmen zu prüfen. Auch nach "
+            "Werkzeugaufrufen ist deine Antwort das JSON-Objekt. Steht tool_results im Payload, "
             "sind das die Ergebnisse deiner Aufrufe aus diesem Zyklus; antworte dann ohne weitere Aufrufe."
         )
 
@@ -649,6 +651,20 @@ def execute_tool_call(runner: McpTools, call: Any, tool_calls: list[dict[str, An
     return output
 
 
+def request_final_answer(
+    client: OpenAI,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    tool_calls: list[dict[str, Any]],
+    stop: GracefulExit | None,
+) -> Any:
+    """Frische Schlussanfrage ohne Werkzeuge: der ursprüngliche Payload plus tool_results."""
+    final_prompt = json.dumps({**json.loads(user_prompt), "tool_results": tool_calls}, ensure_ascii=False)
+    conversation = [{"role": "system", "content": system_prompt}, {"role": "user", "content": final_prompt}]
+    return create_response(client, model, conversation, None, stop)
+
+
 def call_model(
     client: OpenAI,
     model: str,
@@ -664,11 +680,15 @@ def call_model(
     folgt eine frische Schlussanfrage ohne Werkzeuge, in der die Ergebnisse als tool_results
     im Payload stehen. Qwen ruft nach einem Werkzeugergebnis sonst weiter Werkzeuge auf (auch
     mit tool_choice "none") oder denkt ohne angebotene Werkzeuge endlos nach.
+
+    Dieselbe Schlussanfrage folgt, wenn das Modell nach Werkzeugaufrufen von selbst aufhört,
+    aber kein JSON liefert (etwa Zeilen wie `thought: "…"`). Ohne Werkzeugaufrufe bleibt es
+    bei einer Anfrage.
     """
     start = time.perf_counter()
-    system_message = {"role": "system", "content": system_prompt}
-    conversation: list[Any] = [system_message, {"role": "user", "content": user_prompt}]
+    conversation: list[Any] = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
     tool_calls: list[dict[str, Any]] = []
+    final_requested = False
 
     try:
         while True:
@@ -690,11 +710,15 @@ def call_model(
                 conversation.append({"type": "function_call_output", "call_id": call.call_id, "output": output})
 
             if len(tool_calls) >= max_tool_calls or (stop is not None and stop.should_stop):
-                final_prompt = json.dumps({**json.loads(user_prompt), "tool_results": tool_calls}, ensure_ascii=False)
-                response = create_response(
-                    client, model, [system_message, {"role": "user", "content": final_prompt}], None, stop
-                )
+                response = request_final_answer(client, model, system_prompt, user_prompt, tool_calls, stop)
+                final_requested = True
                 break
+
+        result, parse_failed = parse_response(response)
+        if parse_failed and tool_calls and not final_requested:
+            logging.warning("Antwort nach Werkzeugaufrufen ist kein JSON, stelle frische Schlussanfrage.")
+            response = request_final_answer(client, model, system_prompt, user_prompt, tool_calls, stop)
+            result, parse_failed = parse_response(response)
     except ModelUnavailableError as exc:
         fallback = {
             "thought": f"Fehler beim API-Aufruf: {exc}",
@@ -705,7 +729,6 @@ def call_model(
         }
         return ModelOutcome(fallback, time.perf_counter() - start, True, False, tool_calls)
 
-    result, parse_failed = parse_response(response)
     return ModelOutcome(result, time.perf_counter() - start, parse_failed, True, tool_calls)
 
 
