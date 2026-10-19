@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import signal
 import sys
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -50,8 +51,13 @@ class McpJsonLineServer:
         stream_handler = logging.StreamHandler(sys.stderr)
         stream_handler.setFormatter(formatter)
 
+        # Eigene Datei statt der rotierenden Logdatei des Loops: zwei Schreiber mit
+        # eigener Rotation auf derselben Datei würden sich gegenseitig Zeilen verlieren.
+        mcp_log = self.config.log_file.with_name(
+            f"{self.config.log_file.stem}-mcp{self.config.log_file.suffix}"
+        )
         file_handler = RotatingFileHandler(
-            self.config.log_file, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+            mcp_log, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
         )
         file_handler.setFormatter(formatter)
 
@@ -220,7 +226,14 @@ class McpJsonLineServer:
                 self._error(request_id, -32000, str(exc))
 
 
+def _handle_sigterm(_signum: int, _frame: Any) -> None:
+    # Als PID 1 im Container würde SIGTERM sonst ignoriert und `docker stop`
+    # erst nach der Karenzzeit hart beenden.
+    raise SystemExit(0)
+
+
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     McpJsonLineServer().serve_forever()
 
 

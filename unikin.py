@@ -10,6 +10,7 @@ import random
 import re
 import signal
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from openai import OpenAI
 
 JOURNAL_WINDOW = 6
 MAX_RETRIES = 3
+STALE_TMP_SECONDS = 60.0
 RETRY_BACKOFF_SECONDS = 2.0
 LOG_MAX_BYTES = 10 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
@@ -53,9 +55,14 @@ class GracefulExit:
         self.signum: int | None = None
 
     def _handle_signal(self, signum: int, _frame: Any) -> None:
-        # Nur Flags setzen: kein Logging und keine Locks im Signal-Handler.
+        # Nur Flags setzen und ungepuffert auf stderr schreiben: kein Logging
+        # und keine Locks im Signal-Handler.
         self.signum = signum
         self.should_stop = True
+        try:
+            os.write(2, f"Signal {signum} empfangen, beende nach dem laufenden Schritt ...\n".encode())
+        except OSError:
+            pass
 
     def install(self) -> None:
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -160,8 +167,23 @@ def initial_state(config: AgentConfig) -> dict[str, Any]:
     }
 
 
+def remove_stale_tmp_files(config: AgentConfig) -> None:
+    """Räumt Temp-Dateien weg, die ein harter Abbruch in save_memory hinterlassen hat.
+
+    Nur ältere Dateien: eine frische kann gerade von einem parallelen MCP-Schritt stammen.
+    """
+    cutoff = time.time() - STALE_TMP_SECONDS
+    for tmp_path in config.memory_file.parent.glob(f"{config.memory_file.name}.*.tmp"):
+        try:
+            if tmp_path.stat().st_mtime < cutoff:
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+
 def load_memory(config: AgentConfig) -> dict[str, Any]:
     config.memory_file.parent.mkdir(parents=True, exist_ok=True)
+    remove_stale_tmp_files(config)
 
     if not config.memory_file.exists():
         state = initial_state(config)
@@ -184,12 +206,24 @@ def save_memory(config: AgentConfig, state: dict[str, Any]) -> None:
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     # Atomar schreiben: ein harter Abbruch (SIGKILL, Stromausfall) darf nie eine
     # halbe Datei hinterlassen, die load_memory() sonst still reinitialisieren würde.
-    tmp_path = config.memory_file.with_name(f"{config.memory_file.name}.{os.getpid()}.tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(state, handle, ensure_ascii=False, indent=2)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp_path, config.memory_file)
+    # Eindeutiger Temp-Name statt PID: in Containern ist die PID immer 1, und der
+    # Loop und ein MCP-Schritt können dasselbe Verzeichnis gleichzeitig beschreiben.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=config.memory_file.parent, prefix=f"{config.memory_file.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, config.memory_file)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def clamp_interval(value: float, config: AgentConfig) -> float:

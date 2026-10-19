@@ -6,9 +6,10 @@ services:
     image: unikin:local
     container_name: unikin
     restart: unless-stopped
+    # Ohne .env absichtlich kein Start: der Agent liefe sonst mit dem Platzhalter
+    # "local-model" und würde sein Journal mit Fehlerschritten überschreiben.
     env_file:
-      - path: .env
-        required: false
+      - .env
     environment:
       # Aus dem Container heraus ist LM Studio der Docker-Host, nicht localhost.
       # OPENAI_BASE_URL in .env gilt nur für den nativen Start; LMSTUDIO_URL überschreibt für Docker.
@@ -19,9 +20,19 @@ services:
     extra_hosts:
       # Für Docker auf Linux nötig; Docker Desktop und Colima lösen den Namen auch ohne auf.
       - "host.docker.internal:host-gateway"
+    # Die Verzeichnisse müssen auf dem Host existieren (mkdir -p memory logs): so
+    # legt Docker sie weder als root an (Linux) noch unsichtbar in der VM (Colima).
     volumes:
-      - ./memory:/app/memory
-      - ./logs:/app/logs
+      - type: bind
+        source: ./memory
+        target: /app/memory
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./logs
+        target: /app/logs
+        bind:
+          create_host_path: false
     # Abgestimmt auf OPENAI_TIMEOUT_SECONDS (Standard 120 s): ein laufender Modellaufruf
     # darf zu Ende kommen und seinen Zustand speichern, bevor Docker hart beendet.
     stop_grace_period: 150s
