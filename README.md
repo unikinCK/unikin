@@ -60,7 +60,7 @@ LOG_FILE=logs/unikin.log
 
 ## MCP-Server & MCP-Client
 
-`mcp_server.py` ist ein MCP-Server nach Spezifikation auf Basis des offiziellen [MCP-Python-SDK](https://github.com/modelcontextprotocol/python-sdk) (`mcp`, Transport stdio). Er ist die Schnittstelle zum laufenden Loop: Er liest dessen Gedächtnis und legt Nachrichten in die Inbox, schreibt aber nie selbst in `unikin_state.json`. Der Loop bleibt so der einzige Schreiber, parallele Aufrufe überschreiben keinen Zustand.
+`mcp_server.py` ist ein MCP-Server nach Spezifikation auf Basis des offiziellen [MCP-Python-SDK](https://github.com/modelcontextprotocol/python-sdk) (`mcp`). Standard ist stdio; mit `--http` läuft er dauerhaft über Streamable HTTP mit OAuth (siehe [unten](#über-http-mit-oauth-z-b-librechat)). Er ist die Schnittstelle zum laufenden Loop: Er liest dessen Gedächtnis und legt Nachrichten in die Inbox, schreibt aber nie selbst in `unikin_state.json`. Der Loop bleibt so der einzige Schreiber, parallele Aufrufe überschreiben keinen Zustand.
 
 | Tool | Wirkung |
 |---|---|
@@ -106,6 +106,55 @@ In Claude Desktop (`claude_desktop_config.json`):
     }
   }
 }
+```
+
+### Über HTTP mit OAuth (z. B. LibreChat)
+
+`python mcp_server.py --http` startet den Server dauerhaft über Streamable HTTP auf Port 8020. Er ist dann zugleich sein eigener OAuth-2.1-Autorisierungsserver, nach dem Muster von OpenBuchhaltung und mcp_imap:
+
+- Discovery (`/.well-known/oauth-protected-resource/mcp`, `/.well-known/oauth-authorization-server`), dynamische Client-Registrierung (`/register`), `/authorize`, `/token` und `/revoke` liefert das MCP-SDK.
+- `/login` ist die Login- und Zustimmungsseite. Die Konten stehen mit PBKDF2-Hash in `UNIKIN_OAUTH_USERS`. Nach 10 Fehlversuchen in 15 Minuten ist der Login gesperrt.
+- PKCE S256, Access-Token 1 h, Refresh-Token 30 Tage und rotierend. Gespeichert wird nur der SHA-256-Hash der Tokens, in `memory/oauth.sqlite3`.
+- Tokens gelten nur für `<UNIKIN_MCP_PUBLIC_URL>/mcp` (RFC 8707). Redirect-URIs müssen HTTPS sein (HTTP nur auf localhost) und auf einem freigegebenen Host liegen.
+
+| Variable | Bedeutung |
+|---|---|
+| `UNIKIN_MCP_PUBLIC_URL` | HTTPS-Origin, unter der Clients und Browser den Server erreichen; Issuer und Ressource leiten sich davon ab |
+| `UNIKIN_OAUTH_USERS` | Konten als `name:hash`, mehrere durch Komma getrennt |
+| `UNIKIN_OAUTH_ALLOWED_REDIRECT_HOSTS` | Erlaubte Hosts für Redirect-URIs, Standard: der Host von `UNIKIN_MCP_PUBLIC_URL` |
+
+Einrichten auf dem Mac Studio:
+
+1. Passwort-Hash erzeugen. Das Skript fragt das Passwort verdeckt ab und braucht nur die Standardbibliothek, läuft also auch auf dem Laptop: `python3 passwords.py`
+2. In `~/unikin/.env` eintragen:
+   ```dotenv
+   COMPOSE_FILE=docker-compose.yml:docker-compose.mcp-http.yml
+   UNIKIN_MCP_PUBLIC_URL=https://macstudio.tail717550.ts.net:8020
+   UNIKIN_OAUTH_USERS=christoph:<Hash aus Schritt 1>
+   ```
+3. `./deploy.sh` startet zusätzlich den Container `unikin-mcp`, erreichbar nur auf `127.0.0.1:18020`.
+4. Ins Tailnet bringen (nur Tailnet, kein Funnel): `tailscale serve --bg --https=8020 http://127.0.0.1:18020`
+
+In LibreChat (rebelchat, Instanz-Overlay `config/instances/unikin.yaml`):
+
+```yaml
+mcpSettings:
+  allowedDomains:
+    - 'https://macstudio.tail717550.ts.net:8020'
+  allowedAddresses:
+    - 'macstudio.tail717550.ts.net:8020'
+
+mcpServers:
+  unikin:
+    title: 'Unikin'
+    description: 'Autonomer Agent auf dem Mac Studio: Gedächtnis lesen, Nachrichten schicken, Zyklen anstoßen'
+    type: streamable-http
+    url: https://macstudio.tail717550.ts.net:8020/mcp
+    requiresOAuth: true
+    startup: false
+    serverInstructions: true
+    initTimeout: 15000
+    timeout: 300000   # step wartet bis zu 240 s auf einen Zyklus
 ```
 
 ## Werkzeuge: Python-Runner

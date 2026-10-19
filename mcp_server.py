@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""MCP-Server für Unikin über stdio, gebaut auf dem offiziellen MCP-Python-SDK.
+"""MCP-Server für Unikin, gebaut auf dem offiziellen MCP-Python-SDK.
+
+Standard ist stdio; mit --http läuft er dauerhaft über Streamable HTTP (z. B. für
+LibreChat), geschützt per OAuth 2.1 mit eigenem Login (siehe oauth.py).
 
 Der Server ist eine Schnittstelle zum laufenden Loop: Er liest dessen Gedächtnis und
 legt Nachrichten in die Inbox, schreibt aber nie selbst in unikin_state.json. So bleibt
@@ -8,6 +11,7 @@ der Loop der einzige Schreiber, und parallele Aufrufe überschreiben keinen Zust
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -16,13 +20,20 @@ import sys
 import time
 from logging.handlers import RotatingFileHandler
 from typing import Annotated, Any
+from urllib.parse import urlparse
 
 import anyio
+import uvicorn
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
+from starlette.applications import Starlette
 
+from oauth import SCOPE, LoginPage, OAuthStore, UnikinOAuthProvider
+from passwords import parse_users
 from unikin import (
     LOG_BACKUP_COUNT,
     LOG_MAX_BYTES,
@@ -40,6 +51,8 @@ JOURNAL_LIMIT = 40
 STEP_POLL_SECONDS = 1.0
 STEP_TIMEOUT_SECONDS = 240
 STEP_MAX_TIMEOUT_SECONDS = 600
+HTTP_PORT = 8020
+OAUTH_DB_NAME = "oauth.sqlite3"
 
 INSTRUCTIONS = (
     "Schnittstelle zum laufenden Unikin-Agenten, einer autonomen Schleife auf einem lokalen Modell. "
@@ -101,8 +114,33 @@ def find_cycle(state: dict[str, Any], message_id: str) -> dict[str, Any] | None:
     return None
 
 
-def create_server(config: AgentConfig) -> MCPServer:
-    server = MCPServer(name=SERVER_NAME, title="Unikin", version=SERVER_VERSION, instructions=INSTRUCTIONS)
+def create_server(
+    config: AgentConfig,
+    oauth_provider: UnikinOAuthProvider | None = None,
+    users: dict[str, str] | None = None,
+) -> MCPServer:
+    auth = None
+    if oauth_provider is not None:
+        auth = AuthSettings(
+            issuer_url=oauth_provider.public_url,
+            resource_server_url=oauth_provider.resource_url,
+            validate_token_resource=True,
+            required_scopes=[SCOPE],
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE]
+            ),
+            revocation_options=RevocationOptions(enabled=True),
+        )
+    server = MCPServer(
+        name=SERVER_NAME,
+        title="Unikin",
+        version=SERVER_VERSION,
+        instructions=INSTRUCTIONS,
+        auth_server_provider=oauth_provider,
+        auth=auth,
+    )
+    if oauth_provider is not None:
+        server.custom_route("/login", methods=["GET", "POST"])(LoginPage(oauth_provider, users or {}).handle)
 
     @server.tool(title="Zustand lesen", annotations=READ_ONLY)
     def get_state() -> dict[str, Any]:
@@ -172,6 +210,29 @@ def create_server(config: AgentConfig) -> MCPServer:
     return server
 
 
+def split_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def create_http_app(
+    config: AgentConfig,
+    public_url: str,
+    users: dict[str, str],
+    allowed_redirect_hosts: set[str],
+    allowed_hosts: list[str],
+) -> Starlette:
+    """MCP über Streamable HTTP mit OAuth: /mcp, Discovery, /register, /authorize, /token, /revoke, /login."""
+    store = OAuthStore(config.memory_file.parent / OAUTH_DB_NAME)
+    provider = UnikinOAuthProvider(store, public_url, allowed_redirect_hosts)
+    public = urlparse(public_url)
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=[f"{public.scheme}://{public.netloc}"],
+    )
+    return create_server(config, provider, users).streamable_http_app(transport_security=security)
+
+
 def _handle_sigterm(_signum: int, _frame: Any) -> None:
     # Als PID 1 im Container würde SIGTERM sonst ignoriert und `docker stop`
     # erst nach der Karenzzeit hart beenden. SystemExit genügt nicht: Der SDK-Thread,
@@ -181,13 +242,56 @@ def _handle_sigterm(_signum: int, _frame: Any) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="MCP-Server für Unikin")
+    parser.add_argument("--http", action="store_true", help="Streamable HTTP mit OAuth statt stdio")
+    parser.add_argument("--host", default="0.0.0.0", help="Adresse für --http")
+    parser.add_argument("--port", type=int, default=HTTP_PORT, help="Port für --http")
+    args = parser.parse_args()
+
     signal.signal(signal.SIGTERM, _handle_sigterm)
     config = load_config()
-    server = create_server(config)
-    # Erst nach MCPServer(): dessen eigene Logging-Konfiguration wird so ersetzt, nicht verdoppelt.
+
+    if not args.http:
+        server = create_server(config)
+        # Erst nach MCPServer(): dessen eigene Logging-Konfiguration wird so ersetzt, nicht verdoppelt.
+        setup_logging(config)
+        logging.info("MCP-Server gestartet: %s %s (stdio)", SERVER_NAME, SERVER_VERSION)
+        server.run("stdio")
+        return
+
+    public_url = os.getenv("UNIKIN_MCP_PUBLIC_URL", "").strip().rstrip("/")
+    if not public_url:
+        sys.exit("UNIKIN_MCP_PUBLIC_URL fehlt (z. B. https://macstudio.tail717550.ts.net:8020); ohne sie startet --http nicht.")
+    try:
+        users = parse_users(os.getenv("UNIKIN_OAUTH_USERS", ""))
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if not users:
+        sys.exit("UNIKIN_OAUTH_USERS fehlt: Ohne Konto kann sich niemand anmelden. Hash mit `python3 passwords.py` erzeugen.")
+
+    public_host = urlparse(public_url).hostname or ""
+    allowed_redirect_hosts = set(split_list(os.getenv("UNIKIN_OAUTH_ALLOWED_REDIRECT_HOSTS", public_host)))
+    # Host-Header, die /mcp annimmt (Schutz gegen DNS-Rebinding): die öffentliche Adresse und lokal.
+    allowed_hosts = split_list(
+        os.getenv("UNIKIN_MCP_ALLOWED_HOSTS", f"{public_host}:*,{public_host},localhost:*,127.0.0.1:*")
+    )
+    try:
+        app = create_http_app(config, public_url, users, allowed_redirect_hosts, allowed_hosts)
+    except ValueError as exc:
+        sys.exit(f"Ungültige UNIKIN_MCP_PUBLIC_URL: {exc}")
     setup_logging(config)
-    logging.info("MCP-Server gestartet: %s %s", SERVER_NAME, SERVER_VERSION)
-    server.run("stdio")
+    logging.info(
+        "MCP-Server gestartet: %s %s (HTTP auf %s:%s, öffentlich %s, Konten: %s)",
+        SERVER_NAME,
+        SERVER_VERSION,
+        args.host,
+        args.port,
+        public_url,
+        ", ".join(users),
+    )
+    # log_config=None: uvicorn schreibt über unsere Logging-Handler statt eigene anzulegen.
+    # Offene Streams (wartendes step, SSE von LibreChat) sollen `docker stop` nicht aufhalten.
+    uvicorn.run(app, host=args.host, port=args.port, log_config=None, timeout_graceful_shutdown=5)
 
 
 if __name__ == "__main__":
