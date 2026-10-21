@@ -336,7 +336,11 @@ def search_memory(config: AgentConfig, arguments: dict[str, Any]) -> str:
 def find_related_memory(config: AgentConfig, state: dict[str, Any]) -> list[dict[str, Any]]:
     """Archiv-Treffer zum aktuellen next_focus für den Prompt; Qwen ruft search_memory selten von selbst auf.
 
-    Einträge, die recent_journal ohnehin zeigt, fallen weg. Ein Fehler kostet nur die Treffer.
+    Einträge, die recent_journal ohnehin zeigt, fallen weg. Einträge mit Werkzeugergebnissen
+    gehen vor: Der next_focus ist meist ein Vorhaben und gleicht im Wortlaut am meisten früheren
+    Vorhaben. Am 21.10.2026 bekam Unikin so in jeder Runde einer Schleife seine alten Absichten
+    für dasselbe Skript zurück, aber nicht, was beim Ausführen herausgekommen war. Ein Fehler
+    kostet nur die Treffer.
     """
     focus = clean_text(state.get("next_focus"))
     if config.related_memory_hits <= 0 or not focus:
@@ -344,7 +348,7 @@ def find_related_memory(config: AgentConfig, state: dict[str, Any]) -> list[dict
     recent = [str(entry.get("ts")) for entry in state.get("journal", [])[-JOURNAL_WINDOW:] if isinstance(entry, dict)]
     try:
         hits = JournalArchive(archive_path(config)).search(
-            focus, config.related_memory_hits, exclude_ts=recent, skip_repeats=True
+            focus, config.related_memory_hits, exclude_ts=recent, skip_repeats=True, prefer_tool_results=True
         )
     except Exception as exc:  # noqa: BLE001
         logging.warning("Langzeitgedächtnis nicht durchsuchbar, related_memory bleibt leer: %s", describe_error(exc))

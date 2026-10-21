@@ -43,6 +43,9 @@ SAME_CYCLE_SECONDS = 15
 # Unikins eigenes Suchwerkzeug. Seine Ausgabe kommt nicht ins Archiv: Sie besteht aus alten
 # Einträgen, die dort schon stehen, und tauchte sonst bei jeder späteren Suche erneut auf.
 SEARCH_TOOL = "search_memory"
+# Trennt in tool_calls einen Aufruf von seiner Ausgabe. Nur Aufrufe mit Ausgabe tragen sie, eine
+# Suche mit search_memory also nicht.
+TOOL_OUTPUT = "\n→ "
 MAX_QUERY_TERMS = 16
 # Präfixsuche erst ab dieser Wortlänge, sonst findet "die" auch "Dienst" und "dies".
 MIN_PREFIX_CHARS = 4
@@ -50,6 +53,7 @@ SNIPPET_TOKENS = 32
 # Wie similarity_score in unikin.py: Ab hier gilt ein Treffer als Wiederholung eines besseren.
 # Unikin schreibt oft viele Zyklen lang fast denselben Gedanken.
 REPEAT_SIMILARITY = 0.85
+# Um diesen Faktor mehr Kandidaten holt die Suche, wenn sie danach noch aussortiert oder umsortiert.
 REPEAT_CANDIDATES_FACTOR = 5
 
 COLUMNS = ("ts", "loop", "urgency", "thought", "state_update", "next_focus", "inbox", "reply", "tool_calls")
@@ -188,11 +192,14 @@ class JournalArchive:
         exclude_ts: Iterable[str] = (),
         skip_repeats: bool = False,
         readonly: bool = False,
+        prefer_tool_results: bool = False,
     ) -> list[dict[str, Any]]:
         """Die besten Treffer (bm25) mit allen Spalten und der passenden Textstelle in match.
 
         `exclude_ts` blendet Einträge aus, etwa die, die der Prompt ohnehin zeigt. Mit
-        `skip_repeats` fallen Treffer weg, die einem besseren fast gleichen.
+        `skip_repeats` fallen Treffer weg, die einem besseren fast gleichen. Mit
+        `prefer_tool_results` kommen unter den besten Kandidaten die Einträge mit Ergebnissen
+        von Werkzeugen vor denen, die nur Gedanken und Vorhaben enthalten.
         """
         match = fts_query(query)
         if not match or limit < 1:
@@ -205,10 +212,13 @@ class JournalArchive:
             "FROM entries_fts JOIN entries ON entries.id = entries_fts.rowid "
             f"WHERE entries_fts MATCH ? {exclusion} ORDER BY entries_fts.rank LIMIT ?"
         )
-        fetch = limit * REPEAT_CANDIDATES_FACTOR if skip_repeats else limit
+        fetch = limit * REPEAT_CANDIDATES_FACTOR if skip_repeats or prefer_tool_results else limit
         with self._connect(readonly) as conn:
             rows = [dict(row) for row in conn.execute(sql, [match, *exclude, fetch])]
-        return without_repeats(rows, limit) if skip_repeats else rows
+        if prefer_tool_results:
+            # sort ist stabil: In beiden Gruppen bleibt die Reihenfolge von bm25.
+            rows.sort(key=lambda row: not has_tool_results(row))
+        return without_repeats(rows, limit) if skip_repeats else rows[:limit]
 
 
 def fts_query(text: str) -> str:
@@ -221,6 +231,11 @@ def fts_query(text: str) -> str:
     """
     words = list(dict.fromkeys(WORD.findall(str(text or "").lower())))[:MAX_QUERY_TERMS]
     return " OR ".join(f'"{word}"' + ("*" if len(word) >= MIN_PREFIX_CHARS else "") for word in words)
+
+
+def has_tool_results(row: dict[str, Any]) -> bool:
+    """True, wenn im Zyklus des Eintrags ein Werkzeug lief und etwas zurückgab, auch einen Fehler."""
+    return TOOL_OUTPUT in row["tool_calls"]
 
 
 def without_repeats(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -283,7 +298,7 @@ def tool_call_text(call: dict[str, Any]) -> str:
     call_text = f"{name}: {arguments}" if arguments else name
     if name == SEARCH_TOOL:
         return call_text
-    return f"{call_text}\n→ {text_of(call.get('output'))}"
+    return f"{call_text}{TOOL_OUTPUT}{text_of(call.get('output'))}"
 
 
 def readable_arguments(raw: str) -> str:
