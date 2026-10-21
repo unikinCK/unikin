@@ -133,9 +133,12 @@ def test_budget_hit_during_tool_phase_keeps_tools_on_follow_up(config, fake_mode
 @pytest.mark.parametrize(
     ("response", "exhausted"),
     [
-        # LM Studio: hört bei max_output_tokens - 1 auf und meldet trotzdem "completed".
+        # LM Studio hört kurz vor max_output_tokens auf und meldet trotzdem "completed":
+        # Qwen 3.6 bei N-1, GLM 4.5 Air bei N-2.
         (SimpleNamespace(status="completed", usage=SimpleNamespace(output_tokens=11999)), True),
-        (SimpleNamespace(status="completed", usage=SimpleNamespace(output_tokens=11998)), False),
+        (SimpleNamespace(status="completed", usage=SimpleNamespace(output_tokens=11998)), True),
+        (SimpleNamespace(status="completed", usage=SimpleNamespace(output_tokens=11992)), True),
+        (SimpleNamespace(status="completed", usage=SimpleNamespace(output_tokens=11991)), False),
         # OpenAI-API: status "incomplete" mit Grund.
         (
             SimpleNamespace(
