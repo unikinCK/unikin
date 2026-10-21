@@ -27,6 +27,8 @@ from dotenv import load_dotenv
 from mcp import Client as McpClient
 from openai import APITimeoutError, OpenAI
 
+from journal_archive import ARCHIVE_FILENAME, SEARCH_TOOL, JournalArchive
+
 JOURNAL_WINDOW = 6
 MAX_RETRIES = 3
 STALE_TMP_SECONDS = 60.0
@@ -47,6 +49,10 @@ JOURNAL_TOOL_OUTPUT_CHARS = 400
 # "minimal" oder "low" wirken dort nicht, das Modell kennt nur an oder aus. GLM 4.5 Air
 # ignoriert die Angabe und denkt weiter.
 THINKING_OFF = {"effort": "none"}
+# Treffer aus dem Langzeitgedächtnis (search_memory und related_memory).
+DEFAULT_MEMORY_HITS = 3
+MAX_MEMORY_HITS = 5
+MEMORY_HIT_CHARS = 240
 # LM Studio hört je nach Modell kurz vor max_output_tokens auf (Qwen 3.6 bei N-1, GLM 4.5 Air
 # bei N-2); so knapp unter dem Budget endet eine vollständige Antwort praktisch nie.
 BUDGET_SLACK_TOKENS = 8
@@ -70,6 +76,8 @@ class AgentConfig:
     max_tool_calls: int = 3
     # Höchstens so viele Ausgabe-Tokens (Denken plus Antwort) pro Anfrage; 0 = keine Grenze.
     max_output_tokens: int = 12000
+    # So viele Archiv-Treffer zum next_focus stehen ohne Modellaufruf als related_memory im Prompt; 0 = aus.
+    related_memory_hits: int = DEFAULT_MEMORY_HITS
 
 
 class GracefulExit:
@@ -161,6 +169,9 @@ def load_config() -> AgentConfig:
         runner_url=os.getenv("RUNNER_MCP_URL", "").strip(),
         max_tool_calls=max(0, int(to_float(os.getenv("MAX_TOOL_CALLS_PER_CYCLE"), 3))),
         max_output_tokens=max(0, int(to_float(os.getenv("OPENAI_MAX_OUTPUT_TOKENS"), 12000))),
+        related_memory_hits=max(
+            0, min(MAX_MEMORY_HITS, int(to_float(os.getenv("RELATED_MEMORY_HITS"), DEFAULT_MEMORY_HITS)))
+        ),
     )
 
 
@@ -273,6 +284,72 @@ def inbox_dir(config: AgentConfig) -> Path:
     return config.memory_file.parent / INBOX_DIRNAME
 
 
+def archive_path(config: AgentConfig) -> Path:
+    return config.memory_file.parent / ARCHIVE_FILENAME
+
+
+def archive_journal(config: AgentConfig, journal: list[dict[str, Any]]) -> None:
+    """Überträgt das Journal ins Langzeitgedächtnis; ein Fehler wird nur protokolliert.
+
+    Das Archiv übernimmt jeden Eintrag nur einmal (Schlüssel ts). Deshalb bekommt es nach jedem
+    Zyklus das ganze Journal: Der neue Eintrag kommt dazu, und einer, dessen Archivierung vorher
+    scheiterte, wird nachgeholt, solange er noch im Journal steht. Beim ersten Start mit Archiv
+    ist das zugleich das Backfill der vorhandenen Einträge.
+    """
+    try:
+        added = JournalArchive(archive_path(config)).add(journal)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Journal konnte nicht archiviert werden, der Zyklus läuft weiter: %s", describe_error(exc))
+        return
+    if added > 1:
+        logging.info("Langzeitgedächtnis: %s Journal-Einträge archiviert.", added)
+
+
+def memory_hit(row: dict[str, Any]) -> dict[str, Any]:
+    """Kurzer Archiv-Treffer fürs Modell: wann, was es daraus geschlossen hat und die passende Stelle."""
+    hit: dict[str, Any] = {"ts": row["ts"]}
+    if row["loop"] is not None:
+        hit["loop"] = row["loop"]
+    state_update = clean_text(row["state_update"])
+    if len(state_update) > MEMORY_HIT_CHARS:
+        state_update = state_update[:MEMORY_HIT_CHARS].rstrip() + "…"
+    hit["state_update"] = state_update
+    hit["match"] = clean_text(row["match"])
+    return hit
+
+
+def search_memory(config: AgentConfig, arguments: dict[str, Any]) -> str:
+    """Das Werkzeug search_memory: Volltextsuche im Archiv, ohne Modellaufruf."""
+    query = clean_text(arguments.get("query"))
+    if not query:
+        raise ValueError("query fehlt oder ist leer.")
+    limit = int(to_float(str(arguments.get("limit") or DEFAULT_MEMORY_HITS), DEFAULT_MEMORY_HITS))
+    limit = max(1, min(limit, MAX_MEMORY_HITS))
+    hits = JournalArchive(archive_path(config)).search(query, limit, skip_repeats=True)
+    if not hits:
+        return f"Keine Treffer im Langzeitgedächtnis für: {query}"
+    return json.dumps([memory_hit(hit) for hit in hits], ensure_ascii=False)
+
+
+def find_related_memory(config: AgentConfig, state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Archiv-Treffer zum aktuellen next_focus für den Prompt; Qwen ruft search_memory selten von selbst auf.
+
+    Einträge, die recent_journal ohnehin zeigt, fallen weg. Ein Fehler kostet nur die Treffer.
+    """
+    focus = clean_text(state.get("next_focus"))
+    if config.related_memory_hits <= 0 or not focus:
+        return []
+    recent = [str(entry.get("ts")) for entry in state.get("journal", [])[-JOURNAL_WINDOW:] if isinstance(entry, dict)]
+    try:
+        hits = JournalArchive(archive_path(config)).search(
+            focus, config.related_memory_hits, exclude_ts=recent, skip_repeats=True
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Langzeitgedächtnis nicht durchsuchbar, related_memory bleibt leer: %s", describe_error(exc))
+        return []
+    return [memory_hit(hit) for hit in hits]
+
+
 def post_message(config: AgentConfig, text: str, sender: str) -> dict[str, Any]:
     """Legt eine Nachricht als eigene Datei in die Inbox; leerer Text stößt nur einen Zyklus an.
 
@@ -367,6 +444,7 @@ def build_prompt(
     state: dict[str, Any],
     messages: list[dict[str, Any]] | None = None,
     tool_names: list[str] | None = None,
+    related_memory: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     system_prompt = (
         "Du bist Unikin, eine kontinuierlich arbeitende nicht-biologische Agenteninstanz. "
@@ -385,6 +463,18 @@ def build_prompt(
             "Werkzeugaufrufen ist deine Antwort das JSON-Objekt. Steht tool_results im Payload, "
             "sind das die Ergebnisse deiner Aufrufe aus diesem Zyklus; antworte dann ohne weitere Aufrufe."
         )
+    if tool_names and SEARCH_TOOL in tool_names:
+        system_prompt += (
+            f" recent_journal zeigt nur deine letzten {JOURNAL_WINDOW} Journal-Einträge, dein Langzeitgedächtnis "
+            f"reicht viel weiter zurück: {SEARCH_TOOL} durchsucht alle archivierten Einträge, auch "
+            "Werkzeugaufrufe mit ihren Ergebnissen. Suche dort, bevor du etwas prüfst oder berechnest, das du "
+            "vielleicht schon getan hast, und baue auf deinen früheren Ergebnissen auf, statt sie zu wiederholen."
+        )
+    if config.related_memory_hits > 0:
+        system_prompt += (
+            " Steht related_memory im Payload, sind das ältere Einträge aus deinem Langzeitgedächtnis, "
+            "automatisch zu deinem next_focus gefunden: deine eigenen früheren Ergebnisse, keine neuen Eingaben."
+        )
 
     metrics = state.get("metrics", {})
     journal_entries = state.get("journal", [])[-JOURNAL_WINDOW:]
@@ -397,6 +487,7 @@ def build_prompt(
         "next_focus": state.get("next_focus", ""),
         "last_thought": state.get("last_thought", ""),
         "recent_journal": journal_entries,
+        **({"related_memory": related_memory} if related_memory else {}),
         "inbox": [message for message in messages or [] if message.get("text")],
         "telemetry": {
             "loop_count": metrics.get("loop_count", 0),
@@ -562,6 +653,55 @@ class McpTools:
         return text, bool(result.is_error)
 
 
+class Toolbox:
+    """Alle Werkzeuge eines Zyklus: die des Python-Runners (falls erreichbar) und lokale wie search_memory.
+
+    Hat die Schnittstelle von McpTools (definitions, call), call_model nimmt sie als runner.
+    Lokale Werkzeuge laufen im Prozess, ohne Runner und ohne Anfrage an LM Studio, zählen
+    aber zum selben Budget von max_tool_calls.
+    """
+
+    def __init__(self, runner: McpTools | None = None) -> None:
+        self.runner = runner
+        self.definitions: list[dict[str, Any]] = list(runner.definitions) if runner else []
+        self.local: dict[str, Callable[[dict[str, Any]], str]] = {}
+
+    def add(self, definition: dict[str, Any], handler: Callable[[dict[str, Any]], str]) -> None:
+        self.definitions.append(definition)
+        self.local[definition["name"]] = handler
+
+    def call(self, name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
+        if name in self.local:
+            return self.local[name](arguments), False
+        if self.runner is None:
+            return f"Unbekanntes Werkzeug: {name}", True
+        return self.runner.call(name, arguments)
+
+
+SEARCH_MEMORY_DEFINITION: dict[str, Any] = {
+    "type": "function",
+    "name": SEARCH_TOOL,
+    "description": (
+        "Durchsucht dein Langzeitgedächtnis: alle archivierten Journal-Einträge, nicht nur recent_journal "
+        "(Gedanken, Zustände, Werkzeugaufrufe mit Ergebnissen, Nachrichten und Antworten). Liefert die besten "
+        "Treffer mit Zeitstempel (ts), Zyklus (loop), state_update und der passenden Textstelle (match)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Einige treffende Suchbegriffe."},
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_MEMORY_HITS,
+                "description": f"Höchstzahl der Treffer, Standard {DEFAULT_MEMORY_HITS}.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+
 def describe_error(exc: BaseException) -> str:
     """Packt Fehlergruppen aus anyio-Taskgruppen aus, damit das Log die eigentliche Ursache zeigt."""
     while getattr(exc, "exceptions", None):
@@ -570,14 +710,16 @@ def describe_error(exc: BaseException) -> str:
 
 
 def open_runner(target: Any) -> McpTools | None:
-    """Verbindet zum Runner; ist er nicht erreichbar, läuft der Zyklus ohne Werkzeuge."""
+    """Verbindet zum Runner; ist er nicht erreichbar, läuft der Zyklus ohne seine Werkzeuge."""
     if target is None or target == "":
         return None
     runner = McpTools(target)
     try:
         runner.load()
     except Exception as exc:  # noqa: BLE001
-        logging.warning("Python-Runner nicht erreichbar, dieser Zyklus läuft ohne Werkzeuge: %s", describe_error(exc))
+        logging.warning(
+            "Python-Runner nicht erreichbar, dieser Zyklus läuft ohne seine Werkzeuge: %s", describe_error(exc)
+        )
         return None
     return runner if runner.definitions else None
 
@@ -727,7 +869,9 @@ def parse_response(response: Any) -> tuple[dict[str, str], bool]:
     return normalize_response(parsed), False
 
 
-def execute_tool_call(runner: McpTools, call: Any, tool_calls: list[dict[str, Any]], max_tool_calls: int) -> str:
+def execute_tool_call(
+    runner: McpTools | Toolbox, call: Any, tool_calls: list[dict[str, Any]], max_tool_calls: int
+) -> str:
     """Führt einen Werkzeugaufruf des Modells aus, protokolliert ihn und liefert die Ausgabe fürs Modell."""
     if len(tool_calls) >= max_tool_calls:
         return "Werkzeug-Budget dieses Zyklus ist aufgebraucht; dieser Aufruf wurde nicht ausgeführt."
@@ -859,18 +1003,20 @@ def run_cycle(
     metrics = state["metrics"]
     metrics["loop_count"] += 1
     messages = [message for _, message in inbox]
-    runner = None
+    tools = None
     if config.max_tool_calls > 0:
-        runner = open_runner(config.runner_url if runner_target is None else runner_target)
-    tool_names = [tool["name"] for tool in runner.definitions] if runner else []
-    system_prompt, user_prompt = build_prompt(config, state, messages, tool_names)
+        tools = Toolbox(open_runner(config.runner_url if runner_target is None else runner_target))
+        tools.add(SEARCH_MEMORY_DEFINITION, partial(search_memory, config))
+    tool_names = [tool["name"] for tool in tools.definitions] if tools else []
+    related = find_related_memory(config, state)
+    system_prompt, user_prompt = build_prompt(config, state, messages, tool_names, related)
     outcome = call_model(
         client=client,
         model=config.openai_model,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         stop=stop,
-        runner=runner,
+        runner=tools,
         max_tool_calls=config.max_tool_calls,
         max_output_tokens=config.max_output_tokens,
     )
@@ -912,6 +1058,7 @@ def run_cycle(
 
     entry: dict[str, Any] = {
         "ts": datetime.now(timezone.utc).isoformat(),
+        "loop": metrics["loop_count"],
         "thought": result["thought"],
         "state_update": result["state_update"],
         "next_focus": result["next_focus"],
@@ -939,8 +1086,11 @@ def run_cycle(
             }
             for call in outcome.tool_calls
         ]
+    # Mit dem bisherigen Journal: Darin steht auch der Eintrag, den append_journal gleich verwirft.
+    journal = [*state.get("journal", []), entry]
     append_journal(state, entry)
     save_memory(config, state)
+    archive_journal(config, journal)
     if api_ok:
         consume_messages(path for path, _ in inbox)
 
@@ -971,12 +1121,20 @@ def run_agent() -> None:
     logging.info("Starte %s mit Modell '%s' via %s", config.identity, config.openai_model, config.openai_base_url)
     logging.info(
         "Werkzeuge: %s",
-        f"{config.runner_url} (höchstens {config.max_tool_calls} Aufrufe pro Zyklus)"
-        if config.runner_url and config.max_tool_calls > 0
+        f"{config.runner_url or 'kein Runner'} und {SEARCH_TOOL} "
+        f"(höchstens {config.max_tool_calls} Aufrufe pro Zyklus)"
+        if config.max_tool_calls > 0
         else "keine",
+    )
+    logging.info(
+        "Langzeitgedächtnis: %s, related_memory: %s",
+        archive_path(config),
+        f"{config.related_memory_hits} Treffer" if config.related_memory_hits > 0 else "aus",
     )
 
     client = make_client(config)
+    # Backfill: Einträge aus der Zeit vor dem Archiv stehen so schon im ersten Zyklus zur Suche bereit.
+    archive_journal(config, load_memory(config).get("journal", []))
     # Nachrichten, die der letzte Zyklus schon gesehen hat, wecken den Loop nicht erneut:
     # sonst liefe er bei nicht erreichbarem Modell im MIN_INTERVAL-Takt gegen dieselben an.
     seen_ids: set[str] = set()

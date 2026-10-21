@@ -121,7 +121,7 @@ def test_budget_hit_during_tool_phase_keeps_tools_on_follow_up(config, fake_mode
     unikin.run_cycle(config, fake_model, state, [], runner_target=runner)
 
     hit, follow_up, *rest = fake_model.requests
-    assert [tool["name"] for tool in follow_up["tools"]] == ["run_python"]
+    assert [tool["name"] for tool in follow_up["tools"]] == ["run_python", "search_memory"]
     assert follow_up["reasoning"] == {"effort": "none"}
     # Nach dem Werkzeugaufruf denkt das Modell wieder wie gewohnt.
     assert rest and all("reasoning" not in request for request in rest)

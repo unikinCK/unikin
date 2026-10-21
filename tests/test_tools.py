@@ -12,7 +12,7 @@ def test_tool_result_reaches_model_and_journal(config, fake_model, runner):
     unikin.run_cycle(config, fake_model, state, [], runner_target=runner)
 
     first, second = fake_model.requests
-    assert [tool["name"] for tool in first["tools"]] == ["run_python"]
+    assert [tool["name"] for tool in first["tools"]] == ["run_python", "search_memory"]
     assert "run_python" in first["input"][0]["content"]
     assert runner.executed == ["print(6 * 7)"]
     assert second["input"][-1]["type"] == "function_call_output"
@@ -110,14 +110,14 @@ def test_invalid_tool_arguments_are_reported_to_model(config, fake_model, runner
     assert "kein gültiges JSON" in call["output"]
 
 
-def test_unreachable_runner_runs_cycle_without_tools(config, fake_model, caplog):
+def test_unreachable_runner_leaves_only_local_tools(config, fake_model, caplog):
     state = unikin.load_memory(config)
 
     unikin.run_cycle(config, fake_model, state, [], runner_target="http://127.0.0.1:9/mcp")
 
     (request,) = fake_model.requests
-    assert "tools" not in request
-    assert "Werkzeuge" not in request["input"][0]["content"]
+    assert [tool["name"] for tool in request["tools"]] == ["search_memory"]
+    assert "run_python" not in request["input"][0]["content"]
     entry = unikin.load_memory(config)["journal"][-1]
     assert entry["thought"] == "Testgedanke"
     assert "tool_calls" not in entry
@@ -133,4 +133,5 @@ def test_no_tools_when_budget_is_zero(config, fake_model, runner):
     unikin.run_cycle(config, fake_model, state, [], runner_target=runner)
 
     assert "tools" not in fake_model.requests[0]
+    assert "Werkzeuge" not in fake_model.requests[0]["input"][0]["content"]
     assert runner.executed == []

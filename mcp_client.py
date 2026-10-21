@@ -28,6 +28,8 @@ def tool_call(args: argparse.Namespace) -> tuple[str, dict[str, Any], float | No
         return "get_state", {}, None
     if args.command == "journal":
         return "get_journal", {"limit": args.limit}, None
+    if args.command == "search":
+        return "search_journal", {"query": args.query, "limit": args.limit}, None
     if args.command == "send":
         return "send_message", {"text": args.text, "sender": args.sender}, None
     return (
@@ -74,6 +76,10 @@ def main() -> None:
 
     journal_parser = subparsers.add_parser("journal", help="Neueste Journal-Einträge abrufen")
     journal_parser.add_argument("--limit", type=int, default=5, help="Anzahl der Einträge")
+
+    search_parser = subparsers.add_parser("search", help="Alle archivierten Journal-Einträge durchsuchen")
+    search_parser.add_argument("query", help="Suchbegriffe")
+    search_parser.add_argument("--limit", type=int, default=5, help="Höchstzahl der Treffer")
 
     send_parser = subparsers.add_parser("send", help="Nachricht in die Inbox legen (kehrt sofort zurück)")
     send_parser.add_argument("text", help="Nachricht an Unikin")

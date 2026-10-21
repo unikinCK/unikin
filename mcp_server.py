@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import sys
 import time
 from logging.handlers import RotatingFileHandler
@@ -32,6 +33,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 from starlette.applications import Starlette
 
+from journal_archive import JournalArchive
 from oauth import SCOPE, LoginPage, OAuthStore, UnikinOAuthProvider
 from passwords import parse_users
 from unikin import (
@@ -40,6 +42,7 @@ from unikin import (
     MAX_MESSAGE_CHARS,
     MAX_SENDER_CHARS,
     AgentConfig,
+    archive_path,
     load_config,
     post_message,
 )
@@ -48,6 +51,7 @@ SERVER_NAME = "unikin"
 SERVER_VERSION = "0.2.0"
 DEFAULT_SENDER = "Mensch"
 JOURNAL_LIMIT = 40
+SEARCH_LIMIT = 20
 STEP_POLL_SECONDS = 1.0
 STEP_TIMEOUT_SECONDS = 240
 STEP_MAX_TIMEOUT_SECONDS = 600
@@ -56,7 +60,8 @@ OAUTH_DB_NAME = "oauth.sqlite3"
 
 INSTRUCTIONS = (
     "Schnittstelle zum laufenden Unikin-Agenten, einer autonomen Schleife auf einem lokalen Modell. "
-    "get_state und get_journal lesen sein Gedächtnis. send_message legt eine Nachricht in seine Inbox "
+    "get_state und get_journal lesen sein Gedächtnis, search_journal durchsucht alle archivierten "
+    "Journal-Einträge, auch die, die nicht mehr im Journal stehen. send_message legt eine Nachricht in seine Inbox "
     "und kehrt sofort zurück; step stößt sofort einen Zyklus an und wartet auf dessen Ergebnis. "
     "Unikins Antwort auf Nachrichten steht im Journal-Eintrag im Feld reply."
 )
@@ -107,6 +112,17 @@ def read_state(config: AgentConfig) -> dict[str, Any]:
     return state
 
 
+def search_archive(config: AgentConfig, query: str, limit: int) -> list[dict[str, Any]]:
+    """Sucht schreibgeschützt im Archiv des Loops; anlegen und füllen ist allein seine Sache."""
+    path = archive_path(config)
+    if not path.exists():
+        raise ToolError("Noch kein Langzeitgedächtnis: Der Loop hat seit dem Update noch keinen Zyklus abgeschlossen.")
+    try:
+        return JournalArchive(path).search(query, limit, readonly=True)
+    except sqlite3.Error as exc:
+        raise ToolError(f"Langzeitgedächtnis nicht lesbar: {exc}") from exc
+
+
 def find_cycle(state: dict[str, Any], message_id: str) -> dict[str, Any] | None:
     for entry in reversed(state.get("journal", [])):
         if message_id in entry.get("inbox_ids", ()):
@@ -154,8 +170,24 @@ def create_server(
         """Liefert die neuesten Journal-Einträge, ältester zuerst.
 
         Einträge von Zyklen mit Nachrichten enthalten inbox (die Nachrichten) und reply (Unikins Antwort).
+        Das Journal behält nur die letzten 40 Einträge; ältere findet search_journal.
         """
         return read_state(config).get("journal", [])[-limit:]
+
+    @server.tool(title="Langzeitgedächtnis durchsuchen", annotations=READ_ONLY)
+    def search_journal(
+        query: Annotated[str, Field(min_length=1, max_length=500, description="Suchbegriffe, beliebiger Text.")],
+        limit: Annotated[int, Field(ge=1, le=SEARCH_LIMIT, description="Höchstzahl der Treffer.")] = 10,
+    ) -> list[dict[str, Any]]:
+        """Volltextsuche in allen archivierten Journal-Einträgen, bester Treffer zuerst.
+
+        Jeder Treffer enthält ts, loop (bei Einträgen aus der Zeit vor dem Archiv leer), thought,
+        state_update, next_focus, urgency, inbox, reply, tool_calls (gekürzt) und match, die
+        passende Textstelle. Jedes Wort sucht auch nach Wortanfängen, ein Treffer braucht nicht alle.
+        """
+        if not query.strip():
+            raise ToolError("query darf nicht leer sein.")
+        return search_archive(config, query, limit)
 
     @server.tool(title="Nachricht senden", annotations=WRITES_INBOX)
     def send_message(
