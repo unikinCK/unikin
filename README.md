@@ -45,6 +45,7 @@ OPENAI_BASE_URL=http://localhost:1234/v1
 OPENAI_API_KEY=local-key
 OPENAI_MODEL=local-model
 OPENAI_TIMEOUT_SECONDS=300
+OPENAI_MAX_OUTPUT_TOKENS=12000
 
 UNIKIN_IDENTITY=Unikin
 UNIKIN_MISSION=Kontinuierliche reflektierte Arbeit in kleinen Schritten.
@@ -235,6 +236,7 @@ docker compose logs -f
 - Die Basis-URL setzt `docker-compose.yml` für den Container selbst auf `http://host.docker.internal:1234/v1`; `OPENAI_BASE_URL` in `.env` gilt nur für den nativen Start. Läuft LM Studio auf einem anderen Rechner, `LMSTUDIO_URL=http://<host>:1234/v1` in `.env` setzen.
 - `memory/`, `logs/` und `artifacts/` sind Bind-Mounts im Projektverzeichnis und überleben Neustarts, Rebuilds und `docker compose down`. `logs/unikin.log` rotiert bei 10 MB (fünf Generationen); der MCP-Server schreibt nach `logs/unikin-mcp.log`.
 - Jeder Modellaufruf hat ein Timeout von `OPENAI_TIMEOUT_SECONDS` (Standard 300 s). Nach einem Timeout gibt es keinen zweiten Versuch im selben Zyklus, weil LM Studio die abgebrochene Anfrage noch verarbeiten kann; die nächste Anfrage kommt erst nach der regulären Pause, die ab dem Ende des Zyklus zählt. So läuft nie mehr als eine Anfrage von Unikin gleichzeitig. Bei Verbindungs- und HTTP-Fehlern versucht es der Agent bis zu dreimal. `stop_grace_period` (330 s) ist darauf abgestimmt, damit `docker compose stop` einen laufenden Aufruf zu Ende kommen lässt, statt den Agenten hart zu beenden.
+- Jede Anfrage darf höchstens `OPENAI_MAX_OUTPUT_TOKENS` Tokens erzeugen, Denken und Antwort zusammen (Standard 12000, `0` = keine Grenze). Qwen 3.6 gerät gelegentlich in eine Denkschleife ohne Ende; das Budget beendet sie, lange bevor das Timeout greift (12000 Tokens brauchen auf dem Mac Studio rund 125 s). Schneidet das Budget eine Antwort ab, fragt Unikin im selben Zyklus genau einmal ohne Denken nach (`reasoning: {"effort": "none"}`). Die erste Anfrage ist dann in LM Studio schon beendet, es läuft also auch hier nie mehr als eine gleichzeitig. Bleibt auch die Nachfrage ohne Antwort, endet der Zyklus mit „Modell hat das Denkbudget überschritten“.
 - `restart: unless-stopped`: Der Container kommt nach einem Docker-Neustart von selbst wieder, solange er nicht mit `docker compose stop` angehalten wurde.
 
 ### Stoppen, Modell wechseln
@@ -276,7 +278,8 @@ Der Einmal-Container teilt sich `memory/` mit dem Loop-Container: Er liest `unik
 
 - `Connection error` im Log: Der LM-Studio-Server läuft nicht (`lms server start`) oder lauscht unter Colima nur auf `127.0.0.1`.
 - `Request timed out`: Ein Aufruf hat länger als `OPENAI_TIMEOUT_SECONDS` gedauert, z. B. weil LM Studio ein großes Modell per JIT lädt. Der Zyklus endet dann ohne zweiten Versuch, der nächste folgt nach der Pause; bei sehr großen Modellen das Timeout in `.env` erhöhen und `stop_grace_period` in `docker-compose.yml` (im Repository, dann `./deploy.sh`) mitziehen.
-- Reasoning-Modelle (z. B. Qwen 3.6, Nemotron) liefern das JSON im `message`-Teil der Antwort; der Denkteil wird nicht ausgewertet.
+- `Denkbudget von … Tokens überschritten, frage einmal ohne Denken nach` im Log: Das Modell hat bis zum Budget nur nachgedacht, meist in einer Endlosschleife. Das ist kein API-Fehler.
+- Reasoning-Modelle (z. B. Qwen 3.6, Nemotron) liefern das JSON im `message`-Teil der Antwort; der Denkteil wird nicht ausgewertet. Bei Qwen 3.6 schaltet `reasoning: {"effort": "none"}` das Denken ab; `minimal`, `low` und `high` wirken in LM Studio nicht, das Modell kennt nur an oder aus.
 - `Python-Runner nicht erreichbar, dieser Zyklus läuft ohne Werkzeuge` im Log: Der Runner-Container läuft nicht (`docker compose ps`, `docker compose logs runner`). Unikin arbeitet ohne Werkzeuge weiter und versucht es jeden Zyklus erneut.
 - `step` liefert `pending`: Der Loop-Container läuft nicht (`docker compose ps`) oder LM Studio ist nicht erreichbar. Die Nachricht bleibt in `memory/inbox/` und wird nachgeholt, sobald ein Zyklus das Modell erreicht.
 

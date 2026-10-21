@@ -43,6 +43,9 @@ MAX_TOOL_OUTPUT_CHARS = 4000
 # Im Journal kürzer: Die letzten Einträge gehen in jeden Prompt.
 JOURNAL_TOOL_ARGUMENTS_CHARS = 600
 JOURNAL_TOOL_OUTPUT_CHARS = 400
+# Schaltet bei Qwen 3.6 in LM Studio das Denken ab (Jinja-Variable enable_thinking);
+# "minimal" oder "low" wirken dort nicht, das Modell kennt nur an oder aus.
+THINKING_OFF = {"effort": "none"}
 
 
 @dataclass
@@ -61,6 +64,8 @@ class AgentConfig:
     # MCP-Server mit Werkzeugen (Python-Runner); leer = keine Werkzeuge.
     runner_url: str = ""
     max_tool_calls: int = 3
+    # Höchstens so viele Ausgabe-Tokens (Denken plus Antwort) pro Anfrage; 0 = keine Grenze.
+    max_output_tokens: int = 12000
 
 
 class GracefulExit:
@@ -151,6 +156,7 @@ def load_config() -> AgentConfig:
         log_file=Path(os.getenv("LOG_FILE", "logs/unikin.log")),
         runner_url=os.getenv("RUNNER_MCP_URL", "").strip(),
         max_tool_calls=max(0, int(to_float(os.getenv("MAX_TOOL_CALLS_PER_CYCLE"), 3))),
+        max_output_tokens=max(0, int(to_float(os.getenv("OPENAI_MAX_OUTPUT_TOKENS"), 12000))),
     )
 
 
@@ -586,12 +592,18 @@ class ModelUnavailableError(Exception):
     """Das Modell hat auch nach allen Wiederholungen nicht geantwortet."""
 
 
+class ThinkingBudgetExceededError(ModelUnavailableError):
+    """Das Modell hat sein Token-Budget mit Nachdenken aufgebraucht, ohne zu antworten."""
+
+
 def create_response(
     client: OpenAI,
     model: str,
     conversation: list[Any],
     tools: list[dict[str, Any]] | None,
     stop: GracefulExit | None,
+    max_output_tokens: int = 0,
+    reasoning: dict[str, str] | None = None,
 ) -> Any:
     """Eine Anfrage ans Modell; kurze Wiederholungen nur, wenn LM Studio sicher nichts mehr rechnet.
 
@@ -600,13 +612,17 @@ def create_response(
     neben ihr bzw. stünde dahinter an. Deshalb endet der Zyklus sofort, und die nächste
     Anfrage kommt erst nach der regulären Pause, die ab dem Ende dieses Zyklus zählt.
     """
+    extra: dict[str, Any] = {"tools": tools} if tools else {}
+    if max_output_tokens > 0:
+        extra["max_output_tokens"] = max_output_tokens
+    if reasoning is not None:
+        extra["reasoning"] = reasoning
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         if attempt > 1 and stop is not None and stop.should_stop:
             logging.info("Stop angefordert, keine weiteren API-Versuche.")
             break
         try:
-            extra = {"tools": tools} if tools else {}
             return client.responses.create(model=model, input=conversation, temperature=0.3, **extra)
         except APITimeoutError as exc:
             logging.warning("API-Aufruf abgebrochen (Timeout), kein Retry in diesem Zyklus: %s", exc)
@@ -626,6 +642,74 @@ def create_response(
                 else:
                     time.sleep(backoff)
     raise ModelUnavailableError(str(last_error)) from last_error
+
+
+def budget_exhausted(response: Any, max_output_tokens: int) -> bool:
+    """True, wenn das Token-Budget die Antwort abgeschnitten hat.
+
+    LM Studio meldet das nicht wie die OpenAI-API als status "incomplete": Es hört bei
+    max_output_tokens - 1 Tokens auf und meldet "completed"; die Ausgabe ist dann meist
+    nur Reasoning ohne Antwort.
+    """
+    details = getattr(response, "incomplete_details", None)
+    if getattr(details, "reason", None) == "max_output_tokens":
+        return True
+    output_tokens = getattr(getattr(response, "usage", None), "output_tokens", None) or 0
+    return max_output_tokens > 0 and output_tokens >= max_output_tokens - 1
+
+
+def create_budgeted_response(
+    client: OpenAI,
+    model: str,
+    conversation: list[Any],
+    tools: list[dict[str, Any]] | None,
+    stop: GracefulExit | None,
+    max_output_tokens: int,
+) -> Any:
+    """create_response mit Denkbudget; schneidet es die Antwort ab, folgt genau eine Anfrage ohne Denken.
+
+    Qwen 3.6 gerät gelegentlich in eine Denkschleife ohne Ende (am 20.10.2026 jede fünfte
+    Antwort, bis das Timeout sie abbrach). Das Budget beendet sie in LM Studio sauber: Die
+    Anfrage ist danach abgeschlossen, die Nachfrage läuft also nie neben ihr. Wiederholt man
+    sie mit demselben Prompt, denkt das Modell oft wieder endlos; ohne Denken antwortet es in
+    wenigen Sekunden. Ein Timeout der ersten Anfrage endet weiter ohne Nachfrage (create_response).
+    """
+    response = create_response(client, model, conversation, tools, stop, max_output_tokens)
+    if not budget_exhausted(response, max_output_tokens):
+        return response
+
+    logging.warning("Denkbudget von %s Tokens überschritten, frage einmal ohne Denken nach.", max_output_tokens)
+    try:
+        response = create_response(client, model, conversation, tools, stop, max_output_tokens, THINKING_OFF)
+    except ModelUnavailableError as exc:
+        follow_up = "lief ins Zeitlimit" if isinstance(exc.__cause__, APITimeoutError) else f"scheiterte ({exc})"
+        raise thinking_budget_error(max_output_tokens, follow_up) from exc
+    if budget_exhausted(response, max_output_tokens):
+        raise thinking_budget_error(max_output_tokens, "hat das Budget ebenfalls aufgebraucht")
+    return response
+
+
+def thinking_budget_error(max_output_tokens: int, follow_up: str) -> ThinkingBudgetExceededError:
+    return ThinkingBudgetExceededError(
+        f"Modell hat das Denkbudget überschritten: {max_output_tokens} Tokens nur Nachdenken ohne Antwort, "
+        f"und die Nachfrage ohne Denken {follow_up}. LM Studio selbst hat normal geantwortet."
+    )
+
+
+def describe_model_failure(exc: ModelUnavailableError) -> str:
+    """Fehlertext für den nächsten Zyklus: Lag es am Modell oder an der API?
+
+    Aus einem nackten "Request timed out" schloss Unikin auf eine instabile LM-Studio-API,
+    obwohl das Modell nur zu lange nachgedacht hatte.
+    """
+    if isinstance(exc, ThinkingBudgetExceededError):
+        return str(exc)
+    if isinstance(exc.__cause__, APITimeoutError):
+        return (
+            "Modell hat innerhalb des Zeitlimits nicht geantwortet: LM Studio war zu lange beschäftigt, "
+            "etwa weil das Modell zu lange nachgedacht hat oder noch eine andere Anfrage lief."
+        )
+    return f"Fehler beim API-Aufruf: {exc}"
 
 
 def parse_response(response: Any) -> tuple[dict[str, str], bool]:
@@ -668,11 +752,12 @@ def request_final_answer(
     user_prompt: str,
     tool_calls: list[dict[str, Any]],
     stop: GracefulExit | None,
+    max_output_tokens: int,
 ) -> Any:
     """Frische Schlussanfrage ohne Werkzeuge: der ursprüngliche Payload plus tool_results."""
     final_prompt = json.dumps({**json.loads(user_prompt), "tool_results": tool_calls}, ensure_ascii=False)
     conversation = [{"role": "system", "content": system_prompt}, {"role": "user", "content": final_prompt}]
-    return create_response(client, model, conversation, None, stop)
+    return create_budgeted_response(client, model, conversation, None, stop, max_output_tokens)
 
 
 def call_model(
@@ -683,6 +768,7 @@ def call_model(
     stop: GracefulExit | None = None,
     runner: McpTools | None = None,
     max_tool_calls: int = 0,
+    max_output_tokens: int = 0,
 ) -> ModelOutcome:
     """Fragt das Modell; mit `runner` darf es bis zu `max_tool_calls` Werkzeuge aufrufen.
 
@@ -707,8 +793,8 @@ def call_model(
                 and len(tool_calls) < max_tool_calls
                 and not (stop is not None and stop.should_stop)
             )
-            response = create_response(
-                client, model, conversation, runner.definitions if offer_tools else None, stop
+            response = create_budgeted_response(
+                client, model, conversation, runner.definitions if offer_tools else None, stop, max_output_tokens
             )
             calls = [item for item in getattr(response, "output", None) or [] if item.type == "function_call"]
             if not offer_tools or not calls:
@@ -720,18 +806,22 @@ def call_model(
                 conversation.append({"type": "function_call_output", "call_id": call.call_id, "output": output})
 
             if len(tool_calls) >= max_tool_calls or (stop is not None and stop.should_stop):
-                response = request_final_answer(client, model, system_prompt, user_prompt, tool_calls, stop)
+                response = request_final_answer(
+                    client, model, system_prompt, user_prompt, tool_calls, stop, max_output_tokens
+                )
                 final_requested = True
                 break
 
         result, parse_failed = parse_response(response)
         if parse_failed and tool_calls and not final_requested:
             logging.warning("Antwort nach Werkzeugaufrufen ist kein JSON, stelle frische Schlussanfrage.")
-            response = request_final_answer(client, model, system_prompt, user_prompt, tool_calls, stop)
+            response = request_final_answer(
+                client, model, system_prompt, user_prompt, tool_calls, stop, max_output_tokens
+            )
             result, parse_failed = parse_response(response)
     except ModelUnavailableError as exc:
         fallback = {
-            "thought": f"Fehler beim API-Aufruf: {exc}",
+            "thought": describe_model_failure(exc),
             "state_update": "Kein neues Modell-Update aufgrund eines Fehlers.",
             "next_focus": "Stabil bleiben und erneut versuchen",
             "urgency": "low",
@@ -778,6 +868,7 @@ def run_cycle(
         stop=stop,
         runner=runner,
         max_tool_calls=config.max_tool_calls,
+        max_output_tokens=config.max_output_tokens,
     )
     result = outcome.result
     response_seconds = outcome.elapsed

@@ -2,25 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 
-import pytest
-from mcp.server.mcpserver import MCPServer
-
 import unikin
-
-
-@pytest.fixture
-def runner():
-    """Steht für den Python-Runner: ein echter MCP-Server im selben Prozess, der nichts ausführt."""
-    server = MCPServer(name="Python Code Runner")
-    server.executed = []
-
-    @server.tool()
-    def run_python(code: str) -> str:
-        """Führt Python-Code aus."""
-        server.executed.append(code)
-        return f"Exit-Code: 0\nSTDOUT:\n{len(code)} Zeichen ausgeführt\nSTDERR:\n"
-
-    return server
 
 
 def test_tool_result_reaches_model_and_journal(config, fake_model, runner):
