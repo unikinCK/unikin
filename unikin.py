@@ -310,10 +310,12 @@ def memory_hit(row: dict[str, Any]) -> dict[str, Any]:
     hit: dict[str, Any] = {"ts": row["ts"]}
     if row["loop"] is not None:
         hit["loop"] = row["loop"]
-    state_update = clean_text(row["state_update"])
-    if len(state_update) > MEMORY_HIT_CHARS:
-        state_update = state_update[:MEMORY_HIT_CHARS].rstrip() + "…"
-    hit["state_update"] = state_update
+    # Aus dem Log nachgetragene Zyklen haben kein state_update, dann steht der Gedanke da.
+    field = "state_update" if clean_text(row["state_update"]) else "thought"
+    summary = clean_text(row[field])
+    if len(summary) > MEMORY_HIT_CHARS:
+        summary = summary[:MEMORY_HIT_CHARS].rstrip() + "…"
+    hit[field] = summary
     hit["match"] = clean_text(row["match"])
     return hit
 
@@ -684,7 +686,8 @@ SEARCH_MEMORY_DEFINITION: dict[str, Any] = {
     "description": (
         "Durchsucht dein Langzeitgedächtnis: alle archivierten Journal-Einträge, nicht nur recent_journal "
         "(Gedanken, Zustände, Werkzeugaufrufe mit Ergebnissen, Nachrichten und Antworten). Liefert die besten "
-        "Treffer mit Zeitstempel (ts), Zyklus (loop), state_update und der passenden Textstelle (match)."
+        "Treffer mit Zeitstempel (ts), Zyklus (loop), state_update (bei Einträgen ohne: thought) und der "
+        "passenden Textstelle (match)."
     ),
     "parameters": {
         "type": "object",
