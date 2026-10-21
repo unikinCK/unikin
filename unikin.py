@@ -44,8 +44,12 @@ MAX_TOOL_OUTPUT_CHARS = 4000
 JOURNAL_TOOL_ARGUMENTS_CHARS = 600
 JOURNAL_TOOL_OUTPUT_CHARS = 400
 # Schaltet bei Qwen 3.6 in LM Studio das Denken ab (Jinja-Variable enable_thinking);
-# "minimal" oder "low" wirken dort nicht, das Modell kennt nur an oder aus.
+# "minimal" oder "low" wirken dort nicht, das Modell kennt nur an oder aus. GLM 4.5 Air
+# ignoriert die Angabe und denkt weiter.
 THINKING_OFF = {"effort": "none"}
+# LM Studio hört je nach Modell kurz vor max_output_tokens auf (Qwen 3.6 bei N-1, GLM 4.5 Air
+# bei N-2); so knapp unter dem Budget endet eine vollständige Antwort praktisch nie.
+BUDGET_SLACK_TOKENS = 8
 
 
 @dataclass
@@ -647,15 +651,15 @@ def create_response(
 def budget_exhausted(response: Any, max_output_tokens: int) -> bool:
     """True, wenn das Token-Budget die Antwort abgeschnitten hat.
 
-    LM Studio meldet das nicht wie die OpenAI-API als status "incomplete": Es hört bei
-    max_output_tokens - 1 Tokens auf und meldet "completed"; die Ausgabe ist dann meist
-    nur Reasoning ohne Antwort.
+    LM Studio meldet das nicht wie die OpenAI-API als status "incomplete": Es hört ein, zwei
+    Tokens vor max_output_tokens auf und meldet "completed"; die Ausgabe ist dann meist nur
+    Reasoning ohne Antwort.
     """
     details = getattr(response, "incomplete_details", None)
     if getattr(details, "reason", None) == "max_output_tokens":
         return True
     output_tokens = getattr(getattr(response, "usage", None), "output_tokens", None) or 0
-    return max_output_tokens > 0 and output_tokens >= max_output_tokens - 1
+    return max_output_tokens > 0 and output_tokens >= max_output_tokens - BUDGET_SLACK_TOKENS
 
 
 def create_budgeted_response(
