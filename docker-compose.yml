@@ -38,9 +38,9 @@ services:
         target: /app/logs
         bind:
           create_host_path: false
-    # Abgestimmt auf OPENAI_TIMEOUT_SECONDS (Standard 120 s): ein laufender Modellaufruf
+    # Abgestimmt auf OPENAI_TIMEOUT_SECONDS (Standard 300 s): ein laufender Modellaufruf
     # darf zu Ende kommen und seinen Zustand speichern, bevor Docker hart beendet.
-    stop_grace_period: 150s
+    stop_grace_period: 330s
     deploy:
       resources:
         limits:

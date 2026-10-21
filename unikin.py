@@ -25,7 +25,7 @@ from typing import Any
 import anyio
 from dotenv import load_dotenv
 from mcp import Client as McpClient
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 
 JOURNAL_WINDOW = 6
 MAX_RETRIES = 3
@@ -138,7 +138,7 @@ def load_config() -> AgentConfig:
         openai_base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:1234/v1"),
         openai_api_key=os.getenv("OPENAI_API_KEY", "local-key"),
         openai_model=os.getenv("OPENAI_MODEL", "local-model"),
-        openai_timeout=max(1.0, to_float(os.getenv("OPENAI_TIMEOUT_SECONDS"), 120.0)),
+        openai_timeout=max(1.0, to_float(os.getenv("OPENAI_TIMEOUT_SECONDS"), 300.0)),
         identity=os.getenv("UNIKIN_IDENTITY", "Unikin"),
         mission=os.getenv(
             "UNIKIN_MISSION",
@@ -593,6 +593,13 @@ def create_response(
     tools: list[dict[str, Any]] | None,
     stop: GracefulExit | None,
 ) -> Any:
+    """Eine Anfrage ans Modell; kurze Wiederholungen nur, wenn LM Studio sicher nichts mehr rechnet.
+
+    Nach einem Timeout kann LM Studio die abgebrochene Anfrage noch verarbeiten (den Prompt
+    rechnet es nach dem Verbindungsabbruch zu Ende). Ein Retry Sekunden später liefe dann
+    neben ihr bzw. stünde dahinter an. Deshalb endet der Zyklus sofort, und die nächste
+    Anfrage kommt erst nach der regulären Pause, die ab dem Ende dieses Zyklus zählt.
+    """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         if attempt > 1 and stop is not None and stop.should_stop:
@@ -601,6 +608,9 @@ def create_response(
         try:
             extra = {"tools": tools} if tools else {}
             return client.responses.create(model=model, input=conversation, temperature=0.3, **extra)
+        except APITimeoutError as exc:
+            logging.warning("API-Aufruf abgebrochen (Timeout), kein Retry in diesem Zyklus: %s", exc)
+            raise ModelUnavailableError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             logging.warning(

@@ -3,7 +3,9 @@ from __future__ import annotations
 import time
 from functools import partial
 
+import httpx2
 import pytest
+from openai import APITimeoutError
 
 import unikin
 
@@ -59,6 +61,29 @@ def test_message_stays_in_inbox_when_model_is_unreachable(config, fake_model):
     entry = unikin.load_memory(config)["journal"][-1]
     assert "inbox_ids" not in entry
     assert [m["id"] for _, m in unikin.read_inbox(config)] == [message["id"]]
+
+
+def test_timeout_ends_cycle_without_retry(config, fake_model):
+    # Nach einem Timeout kann LM Studio die abgebrochene Anfrage noch rechnen: kein zweiter Versuch.
+    fake_model.error = APITimeoutError(request=httpx2.Request("POST", config.openai_base_url))
+    message = unikin.post_message(config, "Bist du da?", "Test")
+    state = unikin.load_memory(config)
+
+    unikin.run_cycle(config, fake_model, state, unikin.read_inbox(config))
+
+    assert len(fake_model.requests) == 1
+    entry = unikin.load_memory(config)["journal"][-1]
+    assert entry["parse_failed"] is True
+    assert [m["id"] for _, m in unikin.read_inbox(config)] == [message["id"]]
+
+
+def test_connection_error_is_retried(config, fake_model):
+    fake_model.error = ConnectionError("LM Studio nicht erreichbar")
+    state = unikin.load_memory(config)
+
+    unikin.run_cycle(config, fake_model, state, [])
+
+    assert len(fake_model.requests) == unikin.MAX_RETRIES
 
 
 def test_trigger_without_text_is_not_shown_to_model(config, fake_model):
