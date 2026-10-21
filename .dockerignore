@@ -2,6 +2,7 @@
 *
 !requirements.txt
 !unikin.py
+!journal_archive.py
 !mcp_server.py
 !mcp_client.py
 !oauth.py
