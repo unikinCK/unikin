@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-COPY unikin.py mcp_server.py mcp_client.py oauth.py passwords.py ./
+COPY unikin.py journal_archive.py mcp_server.py mcp_client.py oauth.py passwords.py ./
 
 # Nicht als root laufen. UID 1000 entspricht dem VM-Benutzer von Colima bzw.
 # dem ersten Benutzer auf Linux-Hosts, damit Bind-Mounts beschreibbar sind.

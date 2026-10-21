@@ -38,7 +38,7 @@ def test_tools_are_listed_with_annotations(config, mode):
 
     tools = {tool.name: tool for tool in anyio.run(main)}
 
-    assert set(tools) == {"get_state", "get_journal", "send_message", "step"}
+    assert set(tools) == {"get_state", "get_journal", "search_journal", "send_message", "step"}
     assert tools["get_state"].annotations.read_only_hint is True
     assert tools["send_message"].annotations.read_only_hint is False
 
@@ -73,6 +73,29 @@ def test_get_journal_returns_newest_entries(config, fake_model):
     result = call_tool(config, "get_journal", {"limit": 2})
 
     assert len(result.structured_content["result"]) == 2
+
+
+def test_search_journal_finds_archived_entries(config, fake_model):
+    state = unikin.load_memory(config)
+    unikin.run_cycle(config, fake_model, state, [])
+    fake_model.payload["thought"] = "Kuramoto mit N=20 simuliert"
+    unikin.run_cycle(config, fake_model, state, [])
+
+    result = call_tool(config, "search_journal", {"query": "Kuramoto"})
+
+    assert not result.is_error
+    (hit,) = result.structured_content["result"]
+    assert (hit["loop"], hit["thought"]) == (2, "Kuramoto mit N=20 simuliert")
+    assert "Kuramoto" in hit["match"]
+
+
+def test_search_journal_without_archive_is_a_tool_error(config):
+    result = call_tool(config, "search_journal", {"query": "Kuramoto"})
+
+    assert result.is_error
+    assert "Noch kein Langzeitgedächtnis" in result.content[0].text
+    # Der Server liest nur: Anlegen ist Sache des Loops.
+    assert not unikin.archive_path(config).exists()
 
 
 def test_step_returns_the_cycle_that_read_the_note(config, fake_model):

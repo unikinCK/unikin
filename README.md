@@ -7,6 +7,7 @@
 - Echte Endlosschleife ohne fachliche Abbruchbedingung
 - Konfigurierbare Identität (`Unikin`) und Mission
 - Persistentes Memory in JSON (`memory/unikin_state.json`)
+- Durchsuchbares Langzeitgedächtnis: Jeder Journal-Eintrag landet in `memory/unikin_archive.sqlite3` (SQLite mit Volltextsuche). Unikin durchsucht es mit dem Werkzeug `search_memory`, und passende ältere Einträge zum aktuellen Fokus stehen als `related_memory` im Prompt
 - Robustes Logging auf Konsole und in Datei (`logs/unikin.log`)
 - Strukturierte Modellantwort mit JSON-Feldern:
   - `thought`
@@ -48,7 +49,7 @@ OPENAI_TIMEOUT_SECONDS=300
 OPENAI_MAX_OUTPUT_TOKENS=12000
 
 UNIKIN_IDENTITY=Unikin
-UNIKIN_MISSION=Kontinuierliche reflektierte Arbeit in kleinen Schritten.
+UNIKIN_MISSION=Kontinuierliche reflektierte Arbeit in kleinen Schritten. Baue auf früheren Ergebnissen auf: Durchsuche dein Langzeitgedächtnis, bevor du etwas erneut prüfst.
 
 MIN_INTERVAL_SECONDS=5
 MAX_INTERVAL_SECONDS=300
@@ -56,6 +57,7 @@ DEFAULT_INTERVAL_SECONDS=30
 
 MEMORY_FILE=memory/unikin_state.json
 LOG_FILE=logs/unikin.log
+RELATED_MEMORY_HITS=3
 ```
 
 
@@ -67,6 +69,7 @@ LOG_FILE=logs/unikin.log
 |---|---|
 | `get_state` | Gespeicherter Zustand: Mission, letzter Gedanke, nächster Fokus, Metriken, Journal (nur lesend) |
 | `get_journal` | Die neuesten Journal-Einträge, `limit` 1–40, Standard 10 (nur lesend) |
+| `search_journal` | Volltextsuche im [Langzeitgedächtnis](#langzeitgedächtnis), auch in Einträgen, die nicht mehr im Journal stehen; `query`, `limit` 1–20, Standard 10, bester Treffer zuerst (nur lesend) |
 | `send_message` | Legt eine Nachricht (`text`, optional `sender`) in die Inbox und kehrt sofort zurück |
 | `step` | Stößt sofort einen Zyklus an, optional mit Nachricht (`note`), und wartet auf dessen Journal-Eintrag (`timeout_seconds`, Standard 240) |
 
@@ -82,6 +85,7 @@ Nachrichten und Antwort landen im Journal-Eintrag des Zyklus (`inbox`, `inbox_id
 python mcp_client.py tools                            # Tool-Liste mit Schemas
 python mcp_client.py state                            # gespeicherter Zustand
 python mcp_client.py journal --limit 3                # neueste Journal-Einträge
+python mcp_client.py search "Kuramoto" --limit 5      # alle archivierten Einträge durchsuchen
 python mcp_client.py send "Hallo Unikin"              # Nachricht in die Inbox, kehrt sofort zurück
 python mcp_client.py step --note "Wie geht es dir?"   # Zyklus anstoßen und auf die Antwort warten
 ```
@@ -167,12 +171,12 @@ So läuft ein Zyklus mit Werkzeugen:
 1. Unikin holt die Tool-Liste vom Runner und bietet sie dem Modell an (Responses-API, Function Calling).
 2. Ruft das Modell ein Werkzeug auf, führt Unikin den Aufruf über MCP aus und gibt die Ausgabe zurück. Das wiederholt sich, bis das Modell mit seinem JSON antwortet.
 3. Pro Zyklus sind höchstens `MAX_TOOL_CALLS_PER_CYCLE` Aufrufe erlaubt (Standard 3). Ist das Budget aufgebraucht, stellt Unikin eine frische Schlussanfrage ohne Werkzeuge, in der die Ergebnisse als `tool_results` stehen. Qwen ruft nach einem Werkzeugergebnis sonst weiter Werkzeuge auf (auch mit `tool_choice: "none"`) oder denkt ohne angebotene Werkzeuge endlos nach. Dieselbe Schlussanfrage stellt Unikin auch, wenn das Modell nach Werkzeugaufrufen von selbst aufhört, aber nicht mit JSON antwortet (etwa mit Zeilen wie `thought: "…"`). Ohne Werkzeugaufrufe bleibt es bei einer Anfrage.
-4. Code und Ausgabe landen gekürzt im Journal-Eintrag (`tool_calls`). Ist der Runner nicht erreichbar, läuft der Zyklus ohne Werkzeuge weiter.
+4. Code und Ausgabe landen gekürzt im Journal-Eintrag (`tool_calls`). Ist der Runner nicht erreichbar, läuft der Zyklus ohne seine Werkzeuge weiter; `search_memory` (siehe [Langzeitgedächtnis](#langzeitgedächtnis)) bleibt verfügbar.
 
 | Variable | Bedeutung |
 |---|---|
 | `RUNNER_MCP_URL` | MCP-Endpunkt des Runners. Im Docker-Betrieb setzt `docker-compose.yml` `http://runner:8812/mcp`; leer (`RUNNER_MCP_URL=` in `.env`) schaltet die Werkzeuge ab |
-| `MAX_TOOL_CALLS_PER_CYCLE` | Höchstzahl der Werkzeugaufrufe pro Zyklus (Standard 3, `0` schaltet ab) |
+| `MAX_TOOL_CALLS_PER_CYCLE` | Höchstzahl der Werkzeugaufrufe pro Zyklus, `run_python` und `search_memory` zusammen (Standard 3, `0` schaltet ab) |
 
 ### Isolation
 
@@ -202,6 +206,32 @@ git submodule update --init
 ```
 
 Neue Runner-Version übernehmen: `git -C runner pull origin main`, dann `git add runner` und committen.
+
+## Langzeitgedächtnis
+
+Das Journal in `unikin_state.json` behält nur die letzten 40 Einträge, und der Prompt zeigt davon sechs (`recent_journal`). Ohne Archiv vergaß Unikin nach etwa einer halben Stunde, was es geprüft und berechnet hatte: Am 20.10. wiederholte es dutzende Male dieselbe Prüfung der Sandbox (`os.listdir`, `code.py`), und seine Kuramoto-Simulationen aus der Nacht waren am Morgen aus seinem Gedächtnis verschwunden.
+
+Das Archiv `memory/unikin_archive.sqlite3` behält jeden Eintrag. Es nutzt `sqlite3` aus der Standardbibliothek mit einem FTS5-Volltextindex, braucht also weder einen eigenen Dienst noch ein Embedding-Modell und schickt keine zusätzliche Anfrage an LM Studio.
+
+- **Was gespeichert wird:** `ts`, `loop`, `thought`, `state_update`, `next_focus`, `urgency`, `inbox`, `reply` und die Werkzeugaufrufe, so gekürzt wie im Journal (Code bis 600, Ausgabe bis 400 Zeichen). Die Ausgabe von `search_memory` selbst wird nicht archiviert, sonst fände jede spätere Suche ihre eigenen alten Ergebnisse.
+- **Wann:** Nach jedem Zyklus, im selben Moment wie `unikin_state.json`, in einer Transaktion. Schlüssel ist `ts`, jeder Eintrag kommt nur einmal hinein. Der Loop übergibt dabei das ganze Journal: Scheitert das Archivieren einmal, steht im Log `Journal konnte nicht archiviert werden, der Zyklus läuft weiter`, und der nächste Zyklus holt den Eintrag nach, solange er noch im Journal steht. Ein Archivfehler bricht nie einen Zyklus ab.
+- **Backfill:** Beim Start übernimmt der Loop die vorhandenen Journal-Einträge. Bei ihnen bleibt `loop` leer, weil das Journal die Zyklusnummer erst seit dem Archiv speichert. Ältere Journale aus gesicherten Zuständen lassen sich nachtragen, doppelte Einträge bleiben dabei wirkungslos:
+  ```bash
+  docker compose run --rm unikin python journal_archive.py import memory/unikin_state.backup-*.json
+  ```
+- **Suche:** Jedes Wort zählt einzeln, ein Treffer braucht nicht alle. Ab vier Buchstaben findet ein Wort auch längere Formen („Ergebnis“ → „Ergebnisse“), Groß- und Kleinschreibung und Umlaute sind egal („Prufung“ findet „Prüfung“). Sortiert wird nach Relevanz (bm25), seltene Wörter wiegen mehr. Es ist eine Wortsuche: Synonyme oder sinnverwandte Begriffe findet sie nicht.
+- **Für Unikin:** Das Werkzeug `search_memory` (`query`, `limit` 1–5, Standard 3) steht neben `run_python` in der Tool-Schleife und zählt zum selben Budget `MAX_TOOL_CALLS_PER_CYCLE`. Es läuft im Loop-Prozess und funktioniert auch, wenn der Runner nicht erreichbar ist. Jeder Treffer enthält `ts`, `loop`, `state_update` (bis 240 Zeichen) und `match`, die passende Textstelle. Fast gleiche Einträge (Unikin schreibt oft viele Zyklen lang denselben Gedanken) zählen als ein Treffer.
+- **related_memory:** Qwen ruft Suchwerkzeuge selten von selbst auf. Deshalb sucht der Loop vor jedem Zyklus mit dem aktuellen `next_focus` im Archiv, ohne Modellaufruf, und legt die besten `RELATED_MEMORY_HITS` Treffer (Standard 3, höchstens 5, `0` schaltet ab) als `related_memory` in den Prompt. Einträge, die `recent_journal` ohnehin zeigt, fallen dabei weg. Auf dem Mac Studio sind das rund 1000 Zeichen zusätzlich pro Prompt.
+- **Für Menschen:** `search_journal` im MCP-Server bzw. `python mcp_client.py search "…"` liefert ganze Einträge, bis zu 20. Der MCP-Server öffnet das Archiv schreibgeschützt.
+- **Größe:** Das Archiv löscht nichts. Ein Eintrag braucht rund 2 KB, bei einem Zyklus alle fünf Minuten sind das etwa 0,6 MB pro Tag.
+
+### Mission anpassen
+
+Die Mission aus `UNIKIN_MISSION` beschreibt Unikin, was es wahrnimmt. Steht dort wie auf dem Mac Studio, sein Gedächtnis sei nur das, was es in `thought`, `state_update` und `next_focus` zurückgibt, widerspricht das dem Archiv. `./deploy.sh` ändert die `.env` auf dem Ziel nie, die Mission muss man dort von Hand ergänzen, etwa so:
+
+```text
+Dein Langzeitgedächtnis: Jeder Zyklus wird archiviert. recent_journal zeigt nur die letzten sechs Einträge; mit dem Werkzeug search_memory durchsuchst du alle früheren, auch Werkzeugaufrufe mit ihren Ergebnissen, und related_memory zeigt dir ältere Einträge zu deinem next_focus. Suche dort, bevor du etwas erneut prüfst oder berechnest, und baue auf deinen früheren Ergebnissen auf.
+```
 
 ## Start
 
@@ -280,7 +310,8 @@ Der Einmal-Container teilt sich `memory/` mit dem Loop-Container: Er liest `unik
 - `Request timed out`: Ein Aufruf hat länger als `OPENAI_TIMEOUT_SECONDS` gedauert, z. B. weil LM Studio ein großes Modell per JIT lädt. Der Zyklus endet dann ohne zweiten Versuch, der nächste folgt nach der Pause; bei sehr großen Modellen das Timeout in `.env` erhöhen und `stop_grace_period` in `docker-compose.yml` (im Repository, dann `./deploy.sh`) mitziehen.
 - `Denkbudget von … Tokens überschritten, frage einmal ohne Denken nach` im Log: Das Modell hat bis zum Budget nur nachgedacht, meist in einer Endlosschleife. Das ist kein API-Fehler.
 - Reasoning-Modelle (z. B. Qwen 3.6, Nemotron) liefern das JSON im `message`-Teil der Antwort; der Denkteil wird nicht ausgewertet. Bei Qwen 3.6 schaltet `reasoning: {"effort": "none"}` das Denken ab; `minimal`, `low` und `high` wirken in LM Studio nicht, das Modell kennt nur an oder aus.
-- `Python-Runner nicht erreichbar, dieser Zyklus läuft ohne Werkzeuge` im Log: Der Runner-Container läuft nicht (`docker compose ps`, `docker compose logs runner`). Unikin arbeitet ohne Werkzeuge weiter und versucht es jeden Zyklus erneut.
+- `Python-Runner nicht erreichbar, dieser Zyklus läuft ohne seine Werkzeuge` im Log: Der Runner-Container läuft nicht (`docker compose ps`, `docker compose logs runner`). Unikin arbeitet ohne `run_python` weiter und versucht es jeden Zyklus erneut.
+- `Journal konnte nicht archiviert werden` oder `Langzeitgedächtnis nicht durchsuchbar` im Log: `memory/unikin_archive.sqlite3` ist nicht schreibbar oder beschädigt. Der Zyklus läuft trotzdem weiter. Prüfen lässt sich die Datei mit `sqlite3 memory/unikin_archive.sqlite3 'PRAGMA integrity_check'`; eine beschädigte Datei beiseitelegen, dann legt der Loop ein neues Archiv an und übernimmt die Einträge, die noch im Journal stehen.
 - `step` liefert `pending`: Der Loop-Container läuft nicht (`docker compose ps`) oder LM Studio ist nicht erreichbar. Die Nachricht bleibt in `memory/inbox/` und wird nachgeholt, sobald ein Zyklus das Modell erreicht.
 
 ## Adaptive Drosselung
@@ -305,6 +336,7 @@ Zusätzlich wird ein kleiner Jitter genutzt, um starre Polling-Muster zu vermeid
 - Memory wird pro Zyklus geladen/aktualisiert/gespeichert.
 - Bei fehlender oder defekter Memory-Datei wird sauber reinitialisiert.
 - Nachrichten an Unikin liegen bis zur Zustellung als einzelne Dateien in `memory/inbox/`.
+- Jeder Journal-Eintrag landet zusätzlich im [Langzeitgedächtnis](#langzeitgedächtnis) `memory/unikin_archive.sqlite3`.
 - Logs landen sowohl in der Konsole als auch in der Datei `logs/unikin.log`.
 - Ordner werden automatisch angelegt.
 

@@ -228,7 +228,7 @@ def test_full_authorization_code_flow(base_url, config):
             await client.call_tool("send_message", {"text": "Hallo per OAuth", "sender": "Test"})
             return names
 
-    assert anyio.run(use_tools) == {"get_state", "get_journal", "send_message", "step"}
+    assert anyio.run(use_tools) == {"get_state", "get_journal", "search_journal", "send_message", "step"}
     assert [message["text"] for _, message in unikin.read_inbox(config)] == ["Hallo per OAuth"]
 
     status, _, body = request(
