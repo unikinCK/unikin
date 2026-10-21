@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from mcp.server.mcpserver import MCPServer
 
 import unikin
 
@@ -23,6 +24,9 @@ class FakeModel:
     Solange `tool_requests` Einträge hat und Werkzeuge angeboten werden, antwortet er
     stattdessen mit einem Werkzeugaufruf (name, arguments als dict oder Rohtext). Danach
     liefert er der Reihe nach die Texte aus `raw_outputs` statt JSON, jeden einmal.
+
+    Die ersten `budget_hits` Antworten schneidet er wie LM Studio am Token-Budget ab: nur
+    Reasoning, output_tokens = max_output_tokens - 1, status "completed".
     """
 
     def __init__(self) -> None:
@@ -35,6 +39,7 @@ class FakeModel:
         self.error: Exception | None = None
         self.tool_requests: list[tuple[str, dict[str, Any] | str]] = []
         self.raw_outputs: list[str] = []
+        self.budget_hits = 0
         self.requests: list[dict[str, Any]] = []
         self.responses = self
 
@@ -42,6 +47,14 @@ class FakeModel:
         self.requests.append(kwargs)
         if self.error is not None:
             raise self.error
+        if self.budget_hits:
+            self.budget_hits -= 1
+            return SimpleNamespace(
+                output=[FakeItem(type="reasoning")],
+                output_text="",
+                status="completed",
+                usage=SimpleNamespace(output_tokens=kwargs["max_output_tokens"] - 1),
+            )
         if self.tool_requests and kwargs.get("tools"):
             name, arguments = self.tool_requests.pop(0)
             call = FakeItem(
@@ -77,6 +90,21 @@ def config(tmp_path: Path) -> unikin.AgentConfig:
         memory_file=tmp_path / "memory" / "unikin_state.json",
         log_file=tmp_path / "logs" / "unikin.log",
     )
+
+
+@pytest.fixture
+def runner():
+    """Steht für den Python-Runner: ein echter MCP-Server im selben Prozess, der nichts ausführt."""
+    server = MCPServer(name="Python Code Runner")
+    server.executed = []
+
+    @server.tool()
+    def run_python(code: str) -> str:
+        """Führt Python-Code aus."""
+        server.executed.append(code)
+        return f"Exit-Code: 0\nSTDOUT:\n{len(code)} Zeichen ausgeführt\nSTDERR:\n"
+
+    return server
 
 
 @pytest.fixture
