@@ -159,6 +159,58 @@ def test_related_memory_brings_back_older_entries_for_the_focus(config, fake_mod
     assert [hit["ts"] for hit in fake_model.user_payload()["related_memory"]] == [KURAMOTO["ts"]]
 
 
+def test_related_memory_puts_tool_results_before_plans(config, fake_model):
+    focus = "Skript für die großen Testdaten ausführen"
+    plans = [
+        journal_entry("2026-10-21T20:00:00+00:00", "Ich führe das Skript für die großen Testdaten aus.", "Skript geplant"),
+        journal_entry("2026-10-21T20:05:00+00:00", "Das korrigierte Skript erzeugt große Testdaten.", "Skript korrigiert"),
+        journal_entry("2026-10-21T20:10:00+00:00", "Jetzt muss ich das Skript endlich ausführen.", "Ausführung geplant"),
+    ]
+    # Auch ein Fehler ist ein Ergebnis: Er zeigt, was nicht geht.
+    ran = journal_entry(
+        "2026-10-21T19:50:00+00:00",
+        "Der erste Lauf mit den Testdaten ist gescheitert.",
+        "psutil fehlt in der Sandbox",
+        tool_calls=[
+            {
+                "name": "run_python",
+                "arguments": json.dumps({"code": "import psutil"}),
+                "output": "Exit-Code: 1\nSTDERR:\nModuleNotFoundError: No module named 'psutil'",
+                "is_error": False,
+            }
+        ],
+    )
+    # Eine Suche im Gedächtnis ist keine neue Beobachtung, ihre Ausgabe kommt nicht ins Archiv.
+    searched = journal_entry(
+        "2026-10-21T20:15:00+00:00",
+        "Im Gedächtnis nach dem Skript für die Testdaten gesucht.",
+        "Suche ohne neues Ergebnis",
+        tool_calls=[{"name": "search_memory", "arguments": json.dumps({"query": "Skript Testdaten"}), "output": "[]"}],
+    )
+    unikin.archive_journal(config, [*plans, ran, searched])
+    by_relevance = [hit["ts"] for hit in archive(config).search(focus, 3, skip_repeats=True)]
+    assert ran["ts"] not in by_relevance
+
+    state = unikin.load_memory(config)
+    state["next_focus"] = focus
+    unikin.run_cycle(config, fake_model, state, [])
+
+    related = [hit["ts"] for hit in fake_model.user_payload()["related_memory"]]
+    # Danach die übrigen Treffer in ihrer Reihenfolge nach Relevanz, die Suche eingeschlossen.
+    assert related == [ran["ts"], *by_relevance[:2]]
+    assert searched["ts"] in by_relevance
+
+
+def test_search_without_repeat_filter_still_returns_at_most_limit(config):
+    entries = [journal_entry(f"2026-10-21T10:0{n}:00+00:00", f"Sandbox Gedanke {n}") for n in range(4)]
+    entries.append({**KURAMOTO, "thought": "Sandbox mit Kuramoto geprüft"})
+    unikin.archive_journal(config, entries)
+
+    hits = archive(config).search("Sandbox", 2, prefer_tool_results=True)
+    assert len(hits) == 2
+    assert hits[0]["ts"] == KURAMOTO["ts"]
+
+
 def test_related_memory_can_be_switched_off(config, fake_model):
     config = dataclasses.replace(config, related_memory_hits=0)
     unikin.archive_journal(config, [KURAMOTO])
