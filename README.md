@@ -16,6 +16,7 @@
   - `urgency` (`low|medium|high`)
 - Fallback-Parsing bei fehlerhaftem JSON
 - Adaptive Drosselung zwischen `MIN_INTERVAL_SECONDS` und `MAX_INTERVAL_SECONDS`
+- [Vorrang für andere Anwendungen](#vorrang-für-andere-anwendungen): Nutzt eine andere Anwendung LM Studio, pausiert Unikin bis 20 Minuten nach ihrer letzten Anfrage
 - Inbox für Nachrichten von außen: Eine neue Nachricht weckt den Loop sofort, Unikin antwortet im Feld `reply`
 - Standardkonformer MCP-Server (offizielles MCP-Python-SDK) zum Lesen des Zustands und Senden von Nachrichten
 - Werkzeug `run_python`: Unikin führt Python-Code in einer netzwerkisolierten Sandbox aus (python-http-mcp-runner per MCP)
@@ -270,6 +271,7 @@ docker compose logs -f
 - Compose startet zwei Container: `unikin` (der Loop) und `unikin-runner` (die Sandbox für `run_python`, siehe [Werkzeuge](#werkzeuge-python-runner)).
 - Ohne `.env` startet Compose absichtlich nicht; ohne `memory/`, `logs/` und `artifacts/` ebenfalls nicht. Auf Linux-Hosts müssen `memory/` und `logs/` für UID 1000 beschreibbar sein, `artifacts/` für UID 10001 (`sudo chown 10001 artifacts`); die Container laufen nicht als root. Unter Colima ist das nicht nötig.
 - Die Basis-URL setzt `docker-compose.yml` für den Container selbst auf `http://host.docker.internal:1234/v1`; `OPENAI_BASE_URL` in `.env` gilt nur für den nativen Start. Läuft LM Studio auf einem anderen Rechner, `LMSTUDIO_URL=http://<host>:1234/v1` in `.env` setzen.
+- Das Serverlog von LM Studio (`~/.lmstudio/server-logs`) bindet Compose nur lesend ein, für den [Vorrang anderer Anwendungen](#vorrang-für-andere-anwendungen). Fehlt das Verzeichnis, startet der Container nicht; läuft LM Studio auf einem anderen Rechner, `LMSTUDIO_SERVER_LOGS` in `.env` auf ein leeres Verzeichnis setzen (und `FOREIGN_REQUEST_COOLDOWN_SECONDS=0`).
 - `memory/`, `logs/` und `artifacts/` sind Bind-Mounts im Projektverzeichnis und überleben Neustarts, Rebuilds und `docker compose down`. `logs/unikin.log` rotiert bei 10 MB (fünf Generationen); der MCP-Server schreibt nach `logs/unikin-mcp.log`.
 - Jeder Modellaufruf hat ein Timeout von `OPENAI_TIMEOUT_SECONDS` (Standard 300 s). Nach einem Timeout gibt es keinen zweiten Versuch im selben Zyklus, weil LM Studio die abgebrochene Anfrage noch verarbeiten kann; die nächste Anfrage kommt erst nach der regulären Pause, die ab dem Ende des Zyklus zählt. So läuft nie mehr als eine Anfrage von Unikin gleichzeitig. Bei Verbindungs- und HTTP-Fehlern versucht es der Agent bis zu dreimal. `stop_grace_period` (330 s) ist darauf abgestimmt, damit `docker compose stop` einen laufenden Aufruf zu Ende kommen lässt, statt den Agenten hart zu beenden.
 - Jede Anfrage darf höchstens `OPENAI_MAX_OUTPUT_TOKENS` Tokens erzeugen, Denken und Antwort zusammen (Standard 12000, `0` = keine Grenze). Qwen 3.6 gerät gelegentlich in eine Denkschleife ohne Ende; das Budget beendet sie, lange bevor das Timeout greift (12000 Tokens brauchen auf dem Mac Studio rund 125 s). Schneidet das Budget eine Antwort ab, fragt Unikin im selben Zyklus genau einmal ohne Denken nach (`reasoning: {"effort": "none"}`). Die erste Anfrage ist dann in LM Studio schon beendet, es läuft also auch hier nie mehr als eine gleichzeitig. Bleibt auch die Nachfrage ohne Antwort, endet der Zyklus mit „Modell hat das Denkbudget überschritten“.
@@ -318,6 +320,8 @@ Der Einmal-Container teilt sich `memory/` mit dem Loop-Container: Er liest `unik
 - Reasoning-Modelle (z. B. Qwen 3.6, Nemotron) liefern das JSON im `message`-Teil der Antwort; der Denkteil wird nicht ausgewertet. Bei Qwen 3.6 schaltet `reasoning: {"effort": "none"}` das Denken ab; `minimal`, `low` und `high` wirken in LM Studio nicht, das Modell kennt nur an oder aus. GLM 4.5 Air ignoriert die Angabe und denkt weiter; dort ist die Nachfrage nach einem Budget-Treffer ein zweiter normaler Versuch.
 - `Python-Runner nicht erreichbar, dieser Zyklus läuft ohne seine Werkzeuge` im Log: Der Runner-Container läuft nicht (`docker compose ps`, `docker compose logs runner`). Unikin arbeitet ohne `run_python` weiter und versucht es jeden Zyklus erneut.
 - `Journal konnte nicht archiviert werden` oder `Langzeitgedächtnis nicht durchsuchbar` im Log: `memory/unikin_archive.sqlite3` ist nicht schreibbar oder beschädigt. Der Zyklus läuft trotzdem weiter. Prüfen lässt sich die Datei mit `sqlite3 memory/unikin_archive.sqlite3 'PRAGMA integrity_check'`; eine beschädigte Datei beiseitelegen, dann legt der Loop ein neues Archiv an und übernimmt die Einträge, die noch im Journal stehen.
+- `bind source path does not exist: …/.lmstudio/server-logs` beim Start: Auf dem Host gibt es kein Serverlog von LM Studio; siehe `LMSTUDIO_SERVER_LOGS` unter [Vorrang für andere Anwendungen](#vorrang-für-andere-anwendungen).
+- Lange keine Zyklen, im Log `Unikin pausiert bis …`: Eine andere Anwendung nutzt LM Studio, das ist Absicht. Nennt die Zeile `POST /v1/responses` mit Unikins eigenem Modell und ohne Prompt-Anfang, schreibt LM Studio keine Inhalte mehr ins Serverlog (siehe Grenzen dort).
 - `step` liefert `pending`: Der Loop-Container läuft nicht (`docker compose ps`) oder LM Studio ist nicht erreichbar. Die Nachricht bleibt in `memory/inbox/` und wird nachgeholt, sobald ein Zyklus das Modell erreicht.
 
 ## Adaptive Drosselung
@@ -336,6 +340,23 @@ Der Agent passt das nächste Abfrageintervall autonom an. Signale:
    - sehr langsame Antworten erhöhen das Intervall leicht
 
 Zusätzlich wird ein kleiner Jitter genutzt, um starre Polling-Muster zu vermeiden.
+
+## Vorrang für andere Anwendungen
+
+LM Studio bedient jedes Modell mit `PARALLEL 1`: Eine Anfrage wartet, bis die vor ihr fertig ist. Läuft gerade ein Zyklus von Unikin, stehen LibreChat, die Buchhaltung oder das Prüfsystem dahinter an. Deshalb pausiert Unikin, sobald eine andere Anwendung LM Studio nutzt, und arbeitet erst weiter, wenn `FOREIGN_REQUEST_COOLDOWN_SECONDS` lang (Standard 1200 s, also 20 Minuten) keine fremde Anfrage mehr kam. Jede weitere fremde Anfrage verlängert die Pause.
+
+- **Erkennung:** Die HTTP-API von LM Studio verrät nicht, für wen ein Modell gerade rechnet. Das Serverlog (`~/.lmstudio/server-logs/JJJJ-MM/JJJJ-MM-TT.N.log`) tut es: Dort steht jede Anfrage mit Endpunkt, Modell und dem Anfang jedes Texts. Unikins eigene Anfragen beginnen mit seinem Systemprompt („Du bist Unikin, eine kontinuierlich …“), jede andere `POST`-Anfrage gilt als fremd. Ausgenommen sind `/v1/embeddings` (eigenes kleines Modell, wartet nicht hinter Unikin) und `GET`-Anfragen wie `/v1/models`. Der Loop liest das Log in seiner Wartephase laufend mit und noch einmal vor jeder Anfrage, die er stellt; das kostet keine Anfrage an LM Studio.
+- **Mitten im Zyklus:** Kommt eine fremde Anfrage, während Unikin arbeitet, stellt er keine weitere Anfrage mehr (Werkzeugschleife, Schlussanfrage, Nachfrage ohne Denken) und bricht den Zyklus ab. Der Zyklus zählt dann nicht: Er hinterlässt keinen Journal-Eintrag, Nachrichten bleiben in der Inbox, Ergebnisse von `run_python` aus diesem Zyklus verfallen. Eine schon laufende Anfrage bricht Unikin nicht ab, weil LM Studio den Prompt auch nach einem Verbindungsabbruch zu Ende rechnet; die fremde Anfrage wartet also höchstens diese eine Anfrage ab.
+- **Nachrichten gehen vor:** Liegt eine Nachricht in der Inbox (`send_message`, `step`), läuft ihr Zyklus auch während der Pause. Wer Unikin über LibreChat schreibt, wartet auf die Antwort, und LibreChats eigene Anfragen an LM Studio lösen die Pause gerade aus. Danach pausiert Unikin weiter.
+- **Neustart:** Beim Start liest der Loop die beiden jüngsten Logdateien. Fremde Anfragen kurz vor dem Start zählen so mit, ein Deploy beendet keine Pause.
+- **Sichtbar:** Im Log stehen Beginn (`Andere Anwendung nutzt LM Studio: POST /v1/chat/completions (Modell, „Prompt-Anfang…“). Unikin pausiert bis …`) und Ende (`Pause beendet nach … Minuten`). Während der Pause steht in `unikin_state.json` (und damit in `get_state`) das Feld `pause` mit `until` (UTC) und `reason`, ohne Prompt-Text.
+- **Grenzen:** Erkannt wird nur, was LM Studio als `Received request: POST …` ins Serverlog schreibt, also Anfragen über die HTTP-API (auf dem Mac Studio alle Anwendungen außer `lms`). LM Studio muss Anfragen mit Inhalt ins Serverlog schreiben; auf dem Mac Studio ist das an (`verbose` und `logSensitiveData` in `~/.lmstudio/.internal/http-server-config.json`). Fehlt der Inhalt, hält Unikin auch seine eigenen Anfragen für fremd und kommt kaum noch zum Arbeiten.
+
+| Variable | Bedeutung |
+|---|---|
+| `FOREIGN_REQUEST_COOLDOWN_SECONDS` | Pause nach der letzten fremden Anfrage in Sekunden (Standard 1200, `0` schaltet ab) |
+| `LMSTUDIO_LOG_DIR` | Serverlog von LM Studio beim nativen Start (Standard `~/.lmstudio/server-logs`); im Container fest `/lmstudio-logs` |
+| `LMSTUDIO_SERVER_LOGS` | Nur Docker: Verzeichnis auf dem Host, das `docker-compose.yml` nur lesend als `/lmstudio-logs` einbindet (Standard `${HOME}/.lmstudio/server-logs`) |
 
 ## Persistenz & Logs
 

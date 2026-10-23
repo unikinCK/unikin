@@ -28,6 +28,7 @@ from mcp import Client as McpClient
 from openai import APITimeoutError, OpenAI
 
 from journal_archive import ARCHIVE_FILENAME, SEARCH_TOOL, JournalArchive
+from lmstudio_watch import OWN_REQUEST_MARKER, ForeignRequestGuard, LmStudioBusyError, LmStudioLog, YieldingClient
 
 JOURNAL_WINDOW = 6
 MAX_RETRIES = 3
@@ -56,6 +57,11 @@ MEMORY_HIT_CHARS = 240
 # LM Studio hört je nach Modell kurz vor max_output_tokens auf (Qwen 3.6 bei N-1, GLM 4.5 Air
 # bei N-2); so knapp unter dem Budget endet eine vollständige Antwort praktisch nie.
 BUDGET_SLACK_TOKENS = 8
+# Nutzt eine andere Anwendung LM Studio, pausiert Unikin bis so lange nach ihrer letzten Anfrage.
+DEFAULT_FOREIGN_COOLDOWN_SECONDS = 1200.0
+DEFAULT_LMSTUDIO_LOG_DIR = Path("~/.lmstudio/server-logs")
+# Während einer Pause prüft der Loop spätestens so oft, ob sie verlängert wurde oder vorbei ist.
+PAUSE_CHECK_SECONDS = 60.0
 
 
 @dataclass
@@ -78,6 +84,9 @@ class AgentConfig:
     max_output_tokens: int = 12000
     # So viele Archiv-Treffer zum next_focus stehen ohne Modellaufruf als related_memory im Prompt; 0 = aus.
     related_memory_hits: int = DEFAULT_MEMORY_HITS
+    # Pause, wenn andere Anwendungen LM Studio nutzen (erkannt im Serverlog); 0 = aus.
+    foreign_request_cooldown: float = DEFAULT_FOREIGN_COOLDOWN_SECONDS
+    lmstudio_log_dir: Path = DEFAULT_LMSTUDIO_LOG_DIR
 
 
 class GracefulExit:
@@ -172,6 +181,10 @@ def load_config() -> AgentConfig:
         related_memory_hits=max(
             0, min(MAX_MEMORY_HITS, int(to_float(os.getenv("RELATED_MEMORY_HITS"), DEFAULT_MEMORY_HITS)))
         ),
+        foreign_request_cooldown=max(
+            0.0, to_float(os.getenv("FOREIGN_REQUEST_COOLDOWN_SECONDS"), DEFAULT_FOREIGN_COOLDOWN_SECONDS)
+        ),
+        lmstudio_log_dir=Path(os.getenv("LMSTUDIO_LOG_DIR") or DEFAULT_LMSTUDIO_LOG_DIR).expanduser(),
     )
 
 
@@ -426,6 +439,22 @@ def has_new_messages(config: AgentConfig, known_ids: set[str]) -> bool:
         return False
 
 
+def wake_up(config: AgentConfig, known_ids: set[str], guard: ForeignRequestGuard) -> bool:
+    """Beendet die Wartephase bei einer neuen Nachricht oder einer fremden Anfrage an LM Studio (dann beginnt die Pause)."""
+    return guard.poll() or has_new_messages(config, known_ids)
+
+
+def note_pause(state: dict[str, Any], pause: dict[str, Any] | None) -> bool:
+    """Hält die laufende Pause in unikin_state.json fest (get_state im MCP-Server); True, wenn sich etwas ändert."""
+    if state.get("pause") == pause:
+        return False
+    if pause is None:
+        state.pop("pause", None)
+    else:
+        state["pause"] = pause
+    return True
+
+
 def consume_messages(paths: Iterable[Path]) -> None:
     for path in paths:
         try:
@@ -452,8 +481,9 @@ def build_prompt(
     tool_names: list[str] | None = None,
     related_memory: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
+    # Am Anfang (OWN_REQUEST_MARKER) erkennt der Wächter Unikins eigene Anfragen im Log von LM Studio.
     system_prompt = (
-        "Du bist Unikin, eine kontinuierlich arbeitende nicht-biologische Agenteninstanz. "
+        f"{OWN_REQUEST_MARKER} arbeitende nicht-biologische Agenteninstanz. "
         "Antworte ausschließlich als gültiges JSON mit den Schlüsseln: thought, state_update, "
         "next_focus, urgency. urgency muss low, medium oder high sein. "
         "Das Feld inbox enthält Nachrichten, die Menschen dir über deinen MCP-Server geschickt haben: "
@@ -777,6 +807,9 @@ def create_response(
             break
         try:
             return client.responses.create(model=model, input=conversation, temperature=0.3, **extra)
+        except LmStudioBusyError:
+            # Keine Störung: Eine andere Anwendung hat Vorrang, der Zyklus endet hier (run_agent).
+            raise
         except APITimeoutError as exc:
             logging.warning("API-Aufruf abgebrochen (Timeout), kein Retry in diesem Zyklus: %s", exc)
             raise ModelUnavailableError(str(exc)) from exc
@@ -1138,8 +1171,19 @@ def run_agent() -> None:
         archive_path(config),
         f"{config.related_memory_hits} Treffer" if config.related_memory_hits > 0 else "aus",
     )
+    logging.info(
+        "Pause bei fremden Anfragen an LM Studio: %s",
+        f"{config.foreign_request_cooldown / 60:g} Minuten nach der letzten, erkannt im Serverlog "
+        f"{config.lmstudio_log_dir}"
+        if config.foreign_request_cooldown > 0
+        else "aus",
+    )
 
     client = make_client(config)
+    guard = ForeignRequestGuard(LmStudioLog(config.lmstudio_log_dir), config.foreign_request_cooldown)
+    guard.start()
+    # Autonome Zyklen fragen vor jeder Anfrage den Wächter; Zyklen mit Nachrichten nehmen client direkt.
+    yielding_client = YieldingClient(client, guard)
     # Backfill: Einträge aus der Zeit vor dem Archiv stehen so schon im ersten Zyklus zur Suche bereit.
     archive_journal(config, load_memory(config).get("journal", []))
     # Nachrichten, die der letzte Zyklus schon gesehen hat, wecken den Loop nicht erneut:
@@ -1164,8 +1208,24 @@ def run_agent() -> None:
         try:
             inbox = read_inbox(config)
             seen_ids = {message["id"] for _, message in inbox}
-            wait_seconds = max(0.1, run_cycle(config, client, state, inbox, exit_flag))
+            paused = guard.paused()
+            if note_pause(state, guard.info()):
+                save_memory(config, state)
+            if paused and not inbox:
+                exit_flag.wait(
+                    min(guard.remaining(), PAUSE_CHECK_SECONDS),
+                    wake=partial(has_new_messages, config, seen_ids),
+                )
+                continue
+            # Nachrichten von Menschen gehen auch in der Pause durch: Wer über step schreibt, wartet auf
+            # die Antwort, und LibreChats eigene Anfragen an LM Studio lösen die Pause ja gerade aus.
+            cycle_client = client if inbox else yielding_client
+            wait_seconds = max(0.1, run_cycle(config, cycle_client, state, inbox, exit_flag))
 
+        except LmStudioBusyError as exc:
+            # Der Zyklus zählt nicht: Zustand und Inbox bleiben, wie sie vor ihm waren.
+            logging.info("Zyklus %s abgebrochen, keine weiteren Anfragen an LM Studio: %s", metrics["loop_count"], exc)
+            continue
         except KeyboardInterrupt:
             logging.info("KeyboardInterrupt empfangen. Fahre herunter ...")
             save_memory(config, state)
@@ -1189,7 +1249,7 @@ def run_agent() -> None:
 
         exit_flag.wait(
             wait_seconds,
-            wake=partial(has_new_messages, config, seen_ids),
+            wake=partial(wake_up, config, seen_ids, guard),
             min_seconds=config.min_interval,
         )
 
