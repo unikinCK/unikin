@@ -19,6 +19,7 @@ services:
       # Pfade im Container sind fest, die Daten liegen über die Volumes im Projektordner.
       MEMORY_FILE: /app/memory/unikin_state.json
       LOG_FILE: /app/logs/unikin.log
+      LMSTUDIO_LOG_DIR: /lmstudio-logs
     extra_hosts:
       # Für Docker auf Linux nötig; Docker Desktop und Colima lösen den Namen auch ohne auf.
       - "host.docker.internal:host-gateway"
@@ -36,6 +37,15 @@ services:
       - type: bind
         source: ./logs
         target: /app/logs
+        bind:
+          create_host_path: false
+      # Serverlog von LM Studio, nur lesend: Daran erkennt Unikin Anfragen anderer Anwendungen
+      # und pausiert (FOREIGN_REQUEST_COOLDOWN_SECONDS). Läuft LM Studio auf einem anderen Rechner,
+      # LMSTUDIO_SERVER_LOGS in .env auf ein leeres Verzeichnis setzen.
+      - type: bind
+        source: ${LMSTUDIO_SERVER_LOGS:-${HOME}/.lmstudio/server-logs}
+        target: /lmstudio-logs
+        read_only: true
         bind:
           create_host_path: false
     # Abgestimmt auf OPENAI_TIMEOUT_SECONDS (Standard 300 s): ein laufender Modellaufruf
