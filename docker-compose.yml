@@ -24,7 +24,7 @@ services:
       # Für Docker auf Linux nötig; Docker Desktop und Colima lösen den Namen auch ohne auf.
       - "host.docker.internal:host-gateway"
     networks:
-      - default  # Weg zu LM Studio auf dem Host
+      - default  # Weg zu LM Studio auf dem Host und ins Internet (fetch_url, nur öffentliche Adressen)
       - sandbox  # nur zum Runner
     # Die Verzeichnisse müssen auf dem Host existieren (mkdir -p memory logs): so
     # legt Docker sie weder als root an (Linux) noch unsichtbar in der VM (Colima).
