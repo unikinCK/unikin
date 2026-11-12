@@ -98,7 +98,7 @@ def test_search_memory_finds_old_results_without_asking_the_model(config, fake_m
     unikin.run_cycle(config, fake_model, state, [])
 
     first, second = fake_model.requests
-    assert [tool["name"] for tool in first["tools"]] == ["search_memory"]
+    assert [tool["name"] for tool in first["tools"]] == ["search_memory", "fetch_url"]
     assert "search_memory durchsucht" in first["input"][0]["content"]
     (hit,) = json.loads(second["input"][-1]["output"])
     assert hit["ts"] == KURAMOTO["ts"]

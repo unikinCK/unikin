@@ -12,7 +12,7 @@ def test_tool_result_reaches_model_and_journal(config, fake_model, runner):
     unikin.run_cycle(config, fake_model, state, [], runner_target=runner)
 
     first, second = fake_model.requests
-    assert [tool["name"] for tool in first["tools"]] == ["run_python", "search_memory"]
+    assert [tool["name"] for tool in first["tools"]] == ["run_python", "search_memory", "fetch_url"]
     assert "run_python" in first["input"][0]["content"]
     assert runner.executed == ["print(6 * 7)"]
     assert second["input"][-1]["type"] == "function_call_output"
@@ -116,7 +116,7 @@ def test_unreachable_runner_leaves_only_local_tools(config, fake_model, caplog):
     unikin.run_cycle(config, fake_model, state, [], runner_target="http://127.0.0.1:9/mcp")
 
     (request,) = fake_model.requests
-    assert [tool["name"] for tool in request["tools"]] == ["search_memory"]
+    assert [tool["name"] for tool in request["tools"]] == ["search_memory", "fetch_url"]
     assert "run_python" not in request["input"][0]["content"]
     entry = unikin.load_memory(config)["journal"][-1]
     assert entry["thought"] == "Testgedanke"
@@ -135,3 +135,71 @@ def test_no_tools_when_budget_is_zero(config, fake_model, runner):
     assert "tools" not in fake_model.requests[0]
     assert "Werkzeuge" not in fake_model.requests[0]["input"][0]["content"]
     assert runner.executed == []
+
+
+def test_web_calls_have_their_own_budget_per_cycle(config, fake_model, runner, monkeypatch):
+    fetched = []
+
+    def fake_fetch(url, *, links=False, max_chars=0):
+        fetched.append((url, links, max_chars))
+        return f"URL: {url}\n\nSeiteninhalt"
+
+    monkeypatch.setattr(unikin, "fetch_url", fake_fetch)
+    config = dataclasses.replace(config, max_tool_calls=5, max_web_calls=2)
+    fake_model.tool_requests = [
+        ("fetch_url", {"url": "https://example.org/a"}),
+        ("fetch_url", {"url": "https://example.org/b", "links": "true"}),
+        # Das Modell ruft fetch_url erneut auf, obwohl es nicht mehr angeboten wird.
+        ("fetch_url", {"url": "https://example.org/c"}),
+        ("run_python", {"code": "print(1)"}),
+    ]
+    state = unikin.load_memory(config)
+
+    unikin.run_cycle(config, fake_model, state, [], runner_target=runner)
+
+    assert fetched == [
+        ("https://example.org/a", False, unikin.MAX_TOOL_OUTPUT_CHARS),
+        ("https://example.org/b", True, unikin.MAX_TOOL_OUTPUT_CHARS),
+    ]
+    assert "fetch_url" in fake_model.requests[0]["input"][0]["content"]
+    assert "höchstens 2 pro Zyklus" in fake_model.requests[0]["input"][0]["content"]
+    offered = [[tool["name"] for tool in request.get("tools", [])] for request in fake_model.requests]
+    assert offered[:3] == [
+        ["run_python", "search_memory", "fetch_url"],
+        ["run_python", "search_memory", "fetch_url"],
+        ["run_python", "search_memory"],
+    ]
+    assert runner.executed == ["print(1)"]
+    calls = unikin.load_memory(config)["journal"][-1]["tool_calls"]
+    assert [call["name"] for call in calls] == ["fetch_url", "fetch_url", "fetch_url", "run_python"]
+    assert "Seiteninhalt" in calls[0]["output"]
+    assert calls[2]["is_error"] is True
+    assert "aufgebraucht" in calls[2]["output"]
+
+    # Der nächste Zyklus hat wieder zwei Internetabrufe.
+    fake_model.requests.clear()
+    fake_model.tool_requests = [("fetch_url", {"url": "https://example.org/d"})]
+    unikin.run_cycle(config, fake_model, unikin.load_memory(config), [], runner_target=runner)
+    assert fetched[-1][0] == "https://example.org/d"
+
+
+def test_failed_web_call_is_reported_to_model(config, fake_model, runner):
+    fake_model.tool_requests = [("fetch_url", {"url": "http://192.168.1.1/admin"})]
+    state = unikin.load_memory(config)
+
+    unikin.run_cycle(config, fake_model, state, [], runner_target=runner)
+
+    (call,) = unikin.load_memory(config)["journal"][-1]["tool_calls"]
+    assert call["is_error"] is True
+    assert "BlockedAddressError" in call["output"]
+    assert "keine öffentliche Adresse" in call["output"]
+
+
+def test_no_internet_when_web_budget_is_zero(config, fake_model, runner):
+    config = dataclasses.replace(config, max_web_calls=0)
+    state = unikin.load_memory(config)
+
+    unikin.run_cycle(config, fake_model, state, [], runner_target=runner)
+
+    assert [tool["name"] for tool in fake_model.requests[0]["tools"]] == ["run_python", "search_memory"]
+    assert "fetch_url" not in fake_model.requests[0]["input"][0]["content"]

@@ -20,6 +20,7 @@
 - Inbox für Nachrichten von außen: Eine neue Nachricht weckt den Loop sofort, Unikin antwortet im Feld `reply`
 - Standardkonformer MCP-Server (offizielles MCP-Python-SDK) zum Lesen des Zustands und Senden von Nachrichten
 - Werkzeug `run_python`: Unikin führt Python-Code in einer netzwerkisolierten Sandbox aus (python-http-mcp-runner per MCP)
+- Werkzeug `fetch_url`: Unikin ruft bis zu zwei Seiten pro Zyklus aus dem Internet ab, nur öffentliche Adressen (siehe [Internet](#werkzeuge-internet))
 
 ## Voraussetzungen
 
@@ -177,7 +178,7 @@ So läuft ein Zyklus mit Werkzeugen:
 | Variable | Bedeutung |
 |---|---|
 | `RUNNER_MCP_URL` | MCP-Endpunkt des Runners. Im Docker-Betrieb setzt `docker-compose.yml` `http://runner:8812/mcp`; leer (`RUNNER_MCP_URL=` in `.env`) schaltet die Werkzeuge ab |
-| `MAX_TOOL_CALLS_PER_CYCLE` | Höchstzahl der Werkzeugaufrufe pro Zyklus, `run_python` und `search_memory` zusammen (Standard 3, `0` schaltet ab) |
+| `MAX_TOOL_CALLS_PER_CYCLE` | Höchstzahl der Werkzeugaufrufe pro Zyklus, `run_python`, `search_memory` und `fetch_url` zusammen (Standard 3, `0` schaltet ab) |
 
 ### Isolation
 
@@ -207,6 +208,22 @@ git submodule update --init
 ```
 
 Neue Runner-Version übernehmen: `git -C runner pull origin main`, dann `git add runner` und committen.
+
+## Werkzeuge: Internet
+
+Mit `fetch_url` ruft Unikin Seiten aus dem Internet ab, höchstens `MAX_WEB_CALLS_PER_CYCLE` pro Zyklus (Standard 2). Das Werkzeug läuft im Loop-Prozess, nicht im Runner: Der Runner bleibt ohne Netz, und Unikin schickt nur eine URL, keinen Code.
+
+- **Parameter:** `url` (http oder https) und `links`. Ohne `links` liefert es den Text der Seite: bei HTML den Inhalt aus `main` bzw. `article` ohne Skripte, Navigation und Fußzeile, bei JSON, XML und Text den Inhalt selbst. Mit `links: true` liefert es stattdessen die Links der Seite (Linktext und absolute URL, die aus dem Hauptinhalt zuerst), um von einer Übersichtsseite weiterzugehen. Die Ausgabe ist wie bei allen Werkzeugen auf 4000 Zeichen gekürzt, mit dem Hinweis, wie lang die Seite war. PDFs, Bilder und andere Binärdateien lehnt es ab.
+- **Budget:** Die Abrufe zählen zu `MAX_TOOL_CALLS_PER_CYCLE`, also bleibt bei den Standardwerten neben zwei Abrufen ein weiterer Werkzeugaufruf. Sind die zwei verbraucht, bietet Unikin `fetch_url` in diesem Zyklus nicht mehr an; ein dritter Aufruf wird nicht ausgeführt, zählt aber zum Gesamtbudget. Auch ein gescheiterter Abruf (HTTP 404, Zeitlimit) verbraucht einen. Jeder Zyklus beginnt wieder bei zwei.
+- **Suche:** Eine Suchmaschine gibt es nicht. DuckDuckGo und andere blocken automatisierte Abfragen. Die Werkzeugbeschreibung nennt dem Modell die Suche der Wikipedia-API (`https://de.wikipedia.org/w/api.php?action=query&list=search&format=json&srsearch=…`); damit sind Suche und Lesen eines Treffers genau die zwei Abrufe.
+- **Sperre fürs lokale Netz:** Abgerufen werden nur öffentliche Adressen. Loopback, private Netze (LAN, Docker-Netze, also auch `host.docker.internal` mit LM Studio und der Runner), Link-Local mit `169.254.169.254` und Tailscale (`100.64.0.0/10`) sind gesperrt, auch als Ziel einer Weiterleitung (höchstens fünf). Löst ein Name auch nur auf eine nicht öffentliche Adresse auf, wird nichts abgerufen. Die Verbindung geht an genau die geprüfte IP, eine zweite DNS-Antwort (DNS-Rebinding) führt also nicht doch ins LAN. URLs mit Zugangsdaten (`user:pw@`) lehnt es ab.
+- **Grenzen:** 20 Sekunden pro Verbindung, 30 Sekunden für den ganzen Abruf, höchstens 2 MB. Gesendet wird ein GET mit dem User-Agent `Mozilla/5.0 (compatible; LLM-Agent-Fetch/1.0)`, ohne Cookies.
+- **Inhalte sind Daten:** Der Systemprompt sagt dem Modell, dass Seiteninhalte fremde Daten sind und keine Anweisungen. Eine Seite kann trotzdem versuchen, das Modell zu steuern. Mehr als weitere GET-Abrufe kann sie damit nicht auslösen: `run_python` hat kein Netz, und Unikin hat keine Werkzeuge, die schreiben oder senden. Über die URL eines solchen Abrufs könnte sie aber Text aus Unikins Prompt nach außen tragen, etwa aus dem Journal oder aus Inbox-Nachrichten; Vertrauliches gehört deshalb nicht in Nachrichten an Unikin.
+- **Journal:** Wie alle Werkzeugaufrufe landen URL und Ausgabe gekürzt im Journal und im Langzeitgedächtnis (Ausgabe bis 400 Zeichen).
+
+| Variable | Bedeutung |
+|---|---|
+| `MAX_WEB_CALLS_PER_CYCLE` | Höchstzahl der Internetabrufe pro Zyklus (Standard 2, `0` schaltet das Internet ab) |
 
 ## Langzeitgedächtnis
 
